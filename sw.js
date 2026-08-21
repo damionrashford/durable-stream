@@ -77,8 +77,49 @@ function boot() {
 
 const apiPrefix = () => new URL("api/", self.registration.scope).pathname;
 
+/*
+ * Cross-origin isolation, synthesized. Off by default — read why before enabling.
+ *
+ * COOP/COEP are response headers on the top-level document, and a static host
+ * sends none, which is why SharedArrayBuffer, the SQLite "opfs" VFS, and JS
+ * self-profiling all looked permanently out of reach here.
+ *
+ * They are not. A controlled page's navigation request passes through this
+ * handler, so the document response can be re-wrapped before the browser sees
+ * it. Measured with this flag on: crossOriginIsolated === true and
+ * SharedArrayBuffer is available on GitHub Pages. The first load is never
+ * isolated — nothing is controlling it yet — so it begins on the next one.
+ *
+ * What it costs, also measured:
+ *   - Under require-corp every cross-origin subresource must carry CORP or be
+ *     fetched with CORS. jsDelivr sends cross-origin-resource-policy, so the
+ *     SQLite CDN assets survive.
+ *   - The SQL read model's worker nonetheless fails to start when isolation is
+ *     on. The CDN import and wasm init both succeed on the page, and an
+ *     unrelated module worker runs fine, so it is specific to that worker and
+ *     is not yet diagnosed.
+ *
+ * So this trades a working feature for a capability nothing here uses yet.
+ * Turn it on when something needs SharedArrayBuffer, and fix the worker first.
+ */
+const ISOLATE = false;
+
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
+
+  if (ISOLATE && event.request.mode === "navigate") {
+    event.respondWith(
+      (async () => {
+        const res = await fetch(event.request);
+        const headers = new Headers(res.headers);
+        headers.set("cross-origin-opener-policy", "same-origin");
+        headers.set("cross-origin-embedder-policy", "require-corp");
+        return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+      })(),
+    );
+    return;
+  }
+
   if (url.origin !== self.location.origin) return;
   // Cheap synchronous test: respondWith must be called before we can await.
   if (!url.pathname.startsWith(apiPrefix())) return;
