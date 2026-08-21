@@ -105,7 +105,7 @@ navigator.serviceWorker.addEventListener("message", async (event) => {
   pending.delete(msg.key);
 
   if (msg.type !== "pull-ok") {
-    body.textContent = "missing";
+    body.textContent = msg.pending ? "still downloading in the background" : "missing";
     return;
   }
 
@@ -131,6 +131,36 @@ for (const id of ["ep-get", "ep-post", "ep-blob"]) {
     await navigator.clipboard.writeText(e.currentTarget.textContent).catch(() => {});
     e.currentTarget.dataset.copied = "true";
     setTimeout(() => delete e.currentTarget.dataset.copied, 1200);
+  });
+}
+
+let durability = "unknown";
+
+async function refreshStatus() {
+  try {
+    const { head, floor, outbox, storage } = await (await fetch(api("api/status"))).json();
+    const pct = storage.quota ? Math.round((storage.usage / storage.quota) * 100) : 0;
+    $("meta").textContent =
+      `head ${head}${floor ? ` (from ${floor})` : ""} · ${pct}% of quota · ${durability}` +
+      (outbox ? ` · ${outbox} queued` : "");
+  } catch {
+    // The stream will show the real problem; don't fight over the status line.
+  }
+}
+
+/*
+ * Cross-tab notification that does not depend on the service worker being alive.
+ * If this tab's stream is dead but another tab appended, we still learn the log
+ * moved and can resync. Note this is scoped to the storage partition, not
+ * strictly the origin.
+ */
+if ("BroadcastChannel" in window) {
+  const channel = new BroadcastChannel("stream-log");
+  channel.addEventListener("message", (e) => {
+    if (e.data?.type === "append" && e.data.id > cursor && es?.readyState !== EventSource.OPEN) {
+      connect(cursor);
+    }
+    if (e.data?.type === "trimmed") refreshStatus();
   });
 }
 
@@ -178,11 +208,20 @@ function awaitController(timeout = 3000) {
     }
     sessionStorage.removeItem("sw-reload");
 
-    // Ask the browser not to evict the log under storage pressure.
-    await navigator.storage?.persist?.().catch(() => {});
+    // The log is the source of truth, so whether its bucket is evictable is not
+    // a detail. A default bucket is "best-effort" and the browser may clear it
+    // under pressure; persist() asks to be exempt. Chromium decides silently
+    // from engagement history, Firefox prompts — so the answer matters and is
+    // reported rather than assumed.
+    const persisted =
+      (await navigator.storage?.persisted?.().catch(() => false)) ||
+      (await navigator.storage?.persist?.().catch(() => false));
+    durability = persisted ? "persisted" : "evictable";
 
     setStatus("wait", "connecting");
     connect();
+    refreshStatus();
+    setInterval(refreshStatus, 5000);
   } catch (err) {
     setStatus("error", String(err));
   }

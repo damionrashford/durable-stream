@@ -77,11 +77,41 @@ async function readFramed(stream) {
   return { header, body };
 }
 
-async function* webTransportFrames(url, signal) {
-  const transport = new WebTransport(url);
-  signal?.addEventListener("abort", () => transport.close(), { once: true });
-  await transport.ready;
+/** How long a WebTransport handshake may take before we give up and use SSE. */
+const HANDSHAKE_MS = 3000;
 
+/**
+ * Complete the handshake, and nothing else.
+ *
+ * Detection must not read a frame: against a genuine HTTP/3 server that simply
+ * has nothing to say yet, the first read blocks forever, so the probe would
+ * neither succeed nor fall back. `ready` settles on the connection alone.
+ */
+async function handshake(url, signal) {
+  const transport = new WebTransport(url);
+  let timer;
+  try {
+    await Promise.race([
+      transport.ready,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("webtransport handshake timed out")), HANDSHAKE_MS);
+      }),
+    ]);
+  } catch (err) {
+    try {
+      transport.close();
+    } catch {
+      // never opened
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+  signal?.addEventListener("abort", () => transport.close(), { once: true });
+  return transport;
+}
+
+async function* webTransportFrames(transport, signal) {
   const streams = transport.incomingUnidirectionalStreams.getReader();
   try {
     while (true) {
@@ -122,14 +152,20 @@ async function* sseFrames(url, { headers, cursor, signal }) {
     if (signal?.aborted) return;
     const data = safeJSON(event.data);
 
-    // SSE cannot carry bytes, so a payload is announced by reference and pulled
-    // over a second request. The frame shape stays identical either way.
+    // SSE cannot carry bytes, so a payload is announced by reference. The frame
+    // carries `href` instead of `body`; the receiver decides how to pull it,
+    // because a large one belongs in Background Fetch rather than this socket.
     if (event.event === "blob" && data?.url) {
-      const res = await fetch(new URL(data.url, url), { signal, headers });
-      if (res.ok && res.body) {
-        yield { kind: "blob", key: data.key, name: data.name, mime: data.mime, body: res.body, id: event.id };
-        continue;
-      }
+      yield {
+        kind: "blob",
+        key: data.key,
+        name: data.name,
+        mime: data.mime,
+        size: data.size,
+        href: new URL(data.url, url).href,
+        id: event.id,
+      };
+      continue;
     }
     yield { kind: "event", type: event.event ?? "message", data, id: event.id };
   }
@@ -153,18 +189,10 @@ function safeJSON(text) {
 export async function openUpstream(url, { headers = {}, cursor = null, signal } = {}) {
   if ("WebTransport" in globalThis) {
     try {
-      const frames = webTransportFrames(url, signal);
-      // Pull one frame to force the handshake; if it throws, the server isn't HTTP/3.
-      const first = await frames.next();
-      return {
-        kind: "webtransport",
-        async *frames() {
-          if (!first.done) yield first.value;
-          yield* frames;
-        },
-      };
+      const transport = await handshake(url, signal);
+      return { kind: "webtransport", frames: () => webTransportFrames(transport, signal) };
     } catch {
-      // fall through
+      // Not HTTP/3, or it never answered. Either way, SSE.
     }
   }
   return { kind: "sse", frames: () => sseFrames(url, { headers, cursor, signal }) };

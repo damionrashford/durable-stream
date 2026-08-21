@@ -9,6 +9,7 @@
  *   POST /api/events              Append {type, data}. Returns the new id.
  *   PUT  /api/blob/:key           Store a payload; announces it on the log.
  *   GET  /api/blob/:key           Stream it back.
+ *   GET  /api/status              Log head/floor, outbox depth, storage durability.
  */
 
 import { createRouter } from "./router.js";
@@ -112,10 +113,35 @@ function streamEvents(request, { log }) {
   });
 }
 
-async function appendEvent(request, { log }) {
+/**
+ * Append locally, then queue the same event for the server if one is configured.
+ *
+ * The local write always succeeds — it is IndexedDB, not the network — so the
+ * page never has to care whether it is online. The upstream copy is deferred to
+ * a `sync` event, which the browser fires once connectivity returns, page open
+ * or not. Registration failing (unsupported, or permission denied) is not fatal:
+ * the operation stays queued and the next flush picks it up.
+ */
+async function appendEvent(request, ctx) {
+  const { log, upstream, registration, outboxTag } = ctx;
   const body = await request.json().catch(() => null);
   if (!body?.type) return json({ error: "type required" }, 400);
-  return json({ id: await log.append({ type: body.type, data: body.data ?? null }) });
+
+  const id = await log.append({ type: body.type, data: body.data ?? null });
+
+  let queued = false;
+  if (upstream) {
+    await log.enqueue({
+      url: upstream,
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: body.type, data: body.data ?? null }),
+    });
+    queued = true;
+    await registration?.sync?.register(outboxTag).catch(() => {});
+  }
+
+  return json({ id, queued });
 }
 
 /**
@@ -126,29 +152,57 @@ async function appendEvent(request, { log }) {
  * garbage, but a logged event with no bytes is a broken promise.
  */
 async function putBlob(request, { log, blobs }, { key }) {
-  const size = await blobs.put(key, request.body);
-  const meta = {
-    name: request.headers.get("x-name") ?? key,
-    mime: request.headers.get("x-mime") || "application/octet-stream",
-    size,
-  };
+  const mime = request.headers.get("x-mime") || "application/octet-stream";
+  const name = request.headers.get("x-name") ?? key;
 
+  let size;
+  let stored;
+  let encoding;
+  try {
+    ({ size, stored, encoding } = await blobs.put(key, request.body, mime));
+  } catch (err) {
+    // Out of space. blobs.put() already removed the partial file, so the store
+    // is consistent; the caller decides whether to trim and retry.
+    if (err?.name === "QuotaExceededError") {
+      return json({ error: "quota exceeded", key }, 507);
+    }
+    throw err;
+  }
+
+  const meta = { name, mime, size, stored, encoding };
   await log.putMeta(key, meta);
   await log.append({ type: "blob", data: { key, ...meta } });
   return json({ key, ...meta });
 }
 
 async function getBlob(_request, { log, blobs }, { key }) {
-  const file = await blobs.get(key);
-  if (!file) return json({ error: "not found" }, 404);
   const meta = (await log.getMeta(key)) ?? {};
-  // A File is a Blob: this response body is lazy and streams off disk.
-  return new Response(file, {
-    headers: {
-      "content-type": meta.mime || "application/octet-stream",
-      "content-length": String(file.size),
-    },
-  });
+  const stream = await blobs.get(key, { encoding: meta.encoding });
+  if (!stream) return json({ error: meta.pending ? "still downloading" : "not found" }, 404);
+
+  // Lazy: bytes come off disk as the consumer reads. No content-length when the
+  // payload was compressed — the on-disk size is not the decoded size, and a
+  // wrong one is worse than none.
+  const headers = { "content-type": meta.mime || "application/octet-stream" };
+  if (!meta.encoding && meta.size) headers["content-length"] = String(meta.size);
+  return new Response(stream, { headers });
+}
+
+/**
+ * Storage truth, because the log is only as durable as its bucket.
+ *
+ * A default bucket is "best-effort" and the browser may clear it under pressure.
+ * `persisted: false` means the source of truth is deletable — worth surfacing
+ * rather than assuming.
+ */
+async function status(_request, { log, blobs, storageStatus }) {
+  const [head, floor, keys, storage] = await Promise.all([
+    log.head(),
+    log.floor(),
+    blobs.keys(),
+    storageStatus(),
+  ]);
+  return json({ head, floor, blobs: keys.length, outbox: (await log.pending()).length, storage });
 }
 
 export function createHandler(base, stores) {
@@ -157,6 +211,7 @@ export function createHandler(base, stores) {
     { method: "POST", path: "/api/events", handler: appendEvent },
     { method: "PUT", path: "/api/blob/:key", handler: putBlob },
     { method: "GET", path: "/api/blob/:key", handler: getBlob },
+    { method: "GET", path: "/api/status", handler: status },
   ]);
 
   /** Returns null when the route isn't ours, so the caller can fall through. */

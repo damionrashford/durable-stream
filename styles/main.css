@@ -31,8 +31,16 @@ h1 {
 
 code { color: var(--live); }
 
-.status {
+.bar {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
   margin-top: .5rem;
+}
+.meta { margin-left: auto; font-size: .72rem; color: var(--dim); }
+
+.status {
   font-size: .72rem;
   letter-spacing: .14em;
   text-transform: uppercase;
