@@ -42,7 +42,7 @@ function boot() {
     const base = new URL(self.registration.scope).pathname;
     // Idempotent, and called from boot() rather than activate() because the worker
     // is killed when idle — this is what reconnects upstream when it wakes.
-    ensureUpstream(upstream, { url: UPSTREAM, log, headers: UPSTREAM_HEADERS });
+    ensureUpstream(upstream, { url: UPSTREAM, log, blobs, headers: UPSTREAM_HEADERS });
     return { log, blobs, handle: createHandler(base, { log, blobs, storageStatus }) };
   })();
   return booted;

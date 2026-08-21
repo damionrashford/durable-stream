@@ -2,15 +2,21 @@
  * The upstream leg.
  *
  * A server cannot dial a browser, so the worker dials out and holds the socket.
- * Whatever arrives is appended to the local log, which every open tab is already
- * reading — so one connection feeds N tabs, and the pages never learn that some
- * events came from a server and others were appended locally.
+ * What arrives is appended to the local log, which every open tab is already
+ * reading — one connection feeds N tabs, and pages never learn which events came
+ * from a server and which were appended locally.
  *
- * fetch() is used rather than EventSource because EventSource is GET-only and
- * cannot send headers; an upstream that needs Authorization is the normal case.
+ * Transport is chosen by capability in transport.js; this file only routes frames.
+ *
+ *   event → the log        small, ordered, cheap
+ *   blob  → OPFS, then the log
+ *
+ * Buffering rule: an event is metadata and may be collected; a payload never is.
+ * blobs.put() pipes the body straight to disk, so a file larger than memory costs
+ * nothing to receive, and backpressure reaches the socket.
  */
 
-import { decodeSSE } from "./sse.js";
+import { openUpstream } from "./transport.js";
 
 const CURSOR = "__upstream_cursor";
 
@@ -18,39 +24,46 @@ const CURSOR = "__upstream_cursor";
  * Idempotent. Safe to call on every request — a service worker is killed when
  * idle, so this is the hook that brings the connection back when it wakes.
  */
-export function ensureUpstream(state, { url, log, headers = {} }) {
+export function ensureUpstream(state, { url, log, blobs, headers = {} }) {
   if (!url || state.running) return state;
   state.running = true;
+  state.abort = new AbortController();
 
   (async () => {
     let backoff = 1000;
 
     while (state.running) {
       try {
-        // Resume where the last connection died, not from the beginning.
         const cursor = (await log.getMeta(CURSOR))?.value ?? null;
-        const res = await fetch(url, {
-          headers: { accept: "text/event-stream", ...headers, ...(cursor ? { "last-event-id": cursor } : {}) },
-        });
-        if (!res.ok || !res.body) throw new Error(`upstream ${res.status}`);
+        const link = await openUpstream(url, { headers, cursor, signal: state.abort.signal });
 
         backoff = 1000;
-        await log.append({ type: "upstream", data: { state: "connected", url } });
+        state.transport = link.kind;
+        await log.append({ type: "upstream", data: { state: "connected", via: link.kind, url } });
 
-        const events = res.body.pipeThrough(new TextDecoderStream()).pipeThrough(decodeSSE());
-        for await (const event of events) {
+        for await (const frame of link.frames()) {
           if (!state.running) break;
-          let data;
-          try {
-            data = JSON.parse(event.data);
-          } catch {
-            data = event.data; // upstream is not obliged to send JSON
+
+          if (frame.kind === "blob") {
+            const key = frame.key ?? crypto.randomUUID();
+            // Straight to disk. Awaiting it is the backpressure.
+            const size = await blobs.put(key, frame.body);
+            const meta = {
+              name: frame.name ?? key,
+              mime: frame.mime || "application/octet-stream",
+              size,
+            };
+            await log.putMeta(key, meta);
+            await log.append({ type: "blob", data: { key, ...meta } });
+          } else {
+            await log.append({ type: frame.type, data: frame.data });
           }
-          await log.append({ type: event.event ?? "message", data });
-          // Persist the cursor per event: the worker can be killed at any point.
-          if (event.id) await log.putMeta(CURSOR, { value: event.id });
+
+          // Persist per frame: the worker can be killed at any point.
+          if (frame.id) await log.putMeta(CURSOR, { value: frame.id });
         }
       } catch (err) {
+        if (!state.running) return;
         await log.append({ type: "upstream", data: { state: "lost", error: String(err) } });
       }
 
@@ -61,4 +74,9 @@ export function ensureUpstream(state, { url, log, headers = {} }) {
   })();
 
   return state;
+}
+
+export function stopUpstream(state) {
+  state.running = false;
+  state.abort?.abort();
 }

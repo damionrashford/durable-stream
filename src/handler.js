@@ -41,40 +41,70 @@ function cursorOf(request) {
  * reading history would fall between the two and be lost forever — the exact gap
  * a resume cursor exists to close.
  */
+/** Events the reader may fall behind by before we stop queueing for it. */
+const HIGH_WATER = 64;
+
 function streamEvents(request, { log }) {
   const resumeFrom = cursorOf(request);
   let unsubscribe = null;
 
-  const source = new ReadableStream({
-    async start(controller) {
-      const emit = (e) =>
-        controller.enqueue({ id: e.id, data: JSON.stringify({ type: e.type, data: e.data }) });
+  const source = new ReadableStream(
+    {
+      async start(controller) {
+        const emit = (e) =>
+          controller.enqueue({ id: e.id, data: JSON.stringify({ type: e.type, data: e.data }) });
 
-      let live = false;
-      const buffered = [];
-      unsubscribe = log.subscribe((e) => {
-        if (!live) return void buffered.push(e);
-        try {
+        let live = false;
+        let lagging = false;
+        let last = resumeFrom;
+        const buffered = [];
+
+        // Subscribe *before* replaying. Otherwise an event appended while we were
+        // reading history falls between the two and is lost — the exact gap a
+        // resume cursor exists to close.
+        unsubscribe = log.subscribe((e) => {
+          if (!live) return void buffered.push(e);
+
+          // desiredSize goes negative when the consumer can't keep up. Queueing
+          // anyway would grow until the tab dies. Because the log is durable we
+          // can drop instead and tell the client to resync from its cursor —
+          // nothing is lost, and memory stays bounded.
+          if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+            if (!lagging) {
+              lagging = true;
+              try {
+                controller.enqueue({ data: JSON.stringify({ type: "lagged", data: { from: last } }) });
+              } catch {
+                unsubscribe?.();
+              }
+            }
+            return;
+          }
+
+          lagging = false;
+          try {
+            emit(e);
+            last = e.id;
+          } catch {
+            unsubscribe?.();
+          }
+        });
+
+        for await (const e of log.since(resumeFrom)) {
           emit(e);
-        } catch {
-          unsubscribe?.();
+          last = e.id;
         }
-      });
 
-      let last = resumeFrom;
-      for await (const e of log.since(resumeFrom)) {
-        emit(e);
-        last = e.id;
-      }
-
-      // Anything that landed during replay, minus what replay already covered.
-      for (const e of buffered) if (e.id > last) emit(e);
-      live = true;
+        // Anything that landed during replay, minus what replay already covered.
+        for (const e of buffered) if (e.id > last) emit(e);
+        live = true;
+      },
+      cancel() {
+        unsubscribe?.();
+      },
     },
-    cancel() {
-      unsubscribe?.();
-    },
-  });
+    new CountQueuingStrategy({ highWaterMark: HIGH_WATER }),
+  );
 
   // Objects → wire strings → bytes. Every stage carries backpressure.
   return new Response(source.pipeThrough(encodeSSE()).pipeThrough(new TextEncoderStream()), {

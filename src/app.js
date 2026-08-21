@@ -4,6 +4,8 @@
  * postMessage rather than encoding bytes into the text stream.
  */
 
+import { render } from "./render.js";
+
 const $ = (id) => document.getElementById(id);
 const api = (path) => new URL(path, document.baseURI).href;
 
@@ -66,6 +68,11 @@ function connect(from = cursor) {
     if (Number.isFinite(id) && id > cursor) cursor = id;
 
     const { type, data } = JSON.parse(e.data);
+
+    // The worker dropped events rather than queue them for a reader that fell
+    // behind. Nothing is lost — the log has them — so resync from our cursor.
+    if (type === "lagged") return void connect(cursor);
+
     const body = row(e.lastEventId, type);
     if (!body) return;
 
@@ -102,15 +109,9 @@ navigator.serviceWorker.addEventListener("message", async (event) => {
     return;
   }
 
-  // msg.stream is a LIVE ReadableStream transferred out of the worker. The bytes
-  // were never text.
-  const blob = await new Response(msg.stream).blob();
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = msg.name ?? msg.key;
-  link.textContent = `${blob.size} B · download`;
-  link.className = "link";
-  body.replaceChildren(link);
+  // msg.stream is a LIVE ReadableStream transferred out of the worker. render()
+  // decides whether to consume it progressively or collect it, by MIME.
+  await render(body, msg);
 });
 
 function pull(meta, body) {
