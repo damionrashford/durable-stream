@@ -6,7 +6,7 @@
  * happen on the first query and never before. Nothing in the app depends on it.
  */
 
-const WORKER_URL = new URL("./query-worker.js", import.meta.url);
+const WORKER_URL = new URL("../workers/query.js", import.meta.url);
 
 export function createQueryClient({ backfill, base }) {
   let worker = null;
