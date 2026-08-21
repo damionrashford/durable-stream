@@ -157,10 +157,13 @@ const apiPrefix = () => new URL("api/", self.registration.scope).pathname;
  * isolated: nothing controls it yet, so isolation starts on the load after
  * registration.
  *
- * Two conditions apply when enabled. Under require-corp every cross-origin
- * subresource must carry CORP or be fetched with CORS. And the SQL read model's
- * worker does not start under isolation, so query.js is unavailable while this
- * is on.
+ * Three conditions apply when enabled. Under require-corp every cross-origin
+ * subresource must carry CORP or be fetched with CORS. A cross-origin document
+ * embedded in an iframe needs more than that — CORP alone does not admit it; it
+ * must also send Cross-Origin-Embedder-Policy itself — which rules out an
+ * iframe relay against an origin that does not cooperate to that degree. And
+ * the SQL read model's worker does not start under isolation, so query.js is
+ * unavailable while this is on.
  */
 const ISOLATE = false;
 
