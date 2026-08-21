@@ -36,11 +36,55 @@ const UPSTREAM_HEADERS = {};
 
 const OUTBOX_TAG = "outbox";
 
+/*
+ * App shell. The log survives offline in IndexedDB, but without the shell in
+ * Cache Storage there is nothing to read it with — a reload with no network
+ * fails before any of this runs. Bump VERSION to invalidate; entries are
+ * served cache-first, so an edit is otherwise invisible to a controlled page.
+ */
+const VERSION = "shell-v1";
+const SHELL = [
+  "./",
+  "./index.html",
+  "./styles/main.css",
+  "./src/app.js",
+  "./src/render.js",
+  "./src/query.js",
+  "./src/handler.js",
+  "./src/router.js",
+  "./src/sse.js",
+  "./src/log.js",
+  "./src/blobs.js",
+  "./src/transport.js",
+  "./src/upstream.js",
+];
+
 /** Minimum gap between retention passes. */
 const MAINTENANCE_MS = 30_000;
 
-self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener("install", (event) =>
+  event.waitUntil(
+    (async () => {
+      const cache = await caches.open(VERSION);
+      // Individually, so one missing entry cannot fail the whole install.
+      await Promise.all(SHELL.map((path) => cache.add(path).catch(() => {})));
+      await self.skipWaiting();
+    })(),
+  ),
+);
+
+self.addEventListener("activate", (event) =>
+  event.waitUntil(
+    (async () => {
+      const stale = (await caches.keys()).filter((k) => k !== VERSION);
+      await Promise.all(stale.map((k) => caches.delete(k)));
+      // Lets the browser start fetching a navigation while this worker boots,
+      // so a cold start costs no more than a warm one.
+      await self.registration.navigationPreload?.enable().catch(() => {});
+      await self.clients.claim();
+    })(),
+  ),
+);
 
 // Module state does not survive worker restarts — this is a per-instance cache,
 // not storage. Everything durable is in IndexedDB or OPFS.
@@ -136,16 +180,48 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (url.origin !== self.location.origin) return;
-  // Cheap synchronous test: respondWith must be called before we can await.
-  if (!url.pathname.startsWith(apiPrefix())) return;
 
-  event.respondWith(
-    (async () => {
-      const { handle } = await boot();
-      return (await handle(event.request)) ?? new Response("no route", { status: 404 });
-    })(),
-  );
+  // Cheap synchronous test: respondWith must be called before we can await.
+  if (url.pathname.startsWith(apiPrefix())) {
+    event.respondWith(
+      (async () => {
+        const { handle } = await boot();
+        return (await handle(event.request)) ?? new Response("no route", { status: 404 });
+      })(),
+    );
+    return;
+  }
+
+  if (event.request.method !== "GET") return;
+  event.respondWith(serveShell(event));
 });
+
+/*
+ * Cache-first for the shell, which never changes within a VERSION. Anything
+ * else falls through to the network and is cached on the way past, so a second
+ * visit works offline. A navigation with no cache entry and no network falls
+ * back to the entry document rather than a browser error page.
+ */
+async function serveShell(event) {
+  const cached = await caches.match(event.request, { ignoreSearch: true });
+  if (cached) return cached;
+
+  try {
+    // Already in flight alongside worker boot, if navigation preload applied.
+    const response = (await event.preloadResponse) || (await fetch(event.request));
+    if (response.ok && event.request.mode !== "navigate") {
+      const copy = response.clone();
+      event.waitUntil(caches.open(VERSION).then((c) => c.put(event.request, copy)));
+    }
+    return response;
+  } catch (err) {
+    if (event.request.mode === "navigate") {
+      const shell = await caches.match("./index.html", { ignoreSearch: true });
+      if (shell) return shell;
+    }
+    throw err;
+  }
+}
 
 /* ── data plane ──────────────────────────────────────────────────────────── */
 

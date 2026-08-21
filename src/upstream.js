@@ -133,6 +133,12 @@ async function receiveBlobExclusive(key, frame, { log, blobs, registration, sign
 
   if (frame.href && frame.size > LARGE_PAYLOAD && registration?.backgroundFetch) {
     try {
+      // A registration under this id may already be downloading from an earlier
+      // announcement. Adopting it resumes; fetching again would be rejected as a
+      // duplicate and lose the progress already made.
+      const existing = await registration.backgroundFetch.get(key);
+      if (existing) return;
+
       await registration.backgroundFetch.fetch(key, [frame.href], {
         title: name,
         downloadTotal: frame.size,
@@ -141,7 +147,7 @@ async function receiveBlobExclusive(key, frame, { log, blobs, registration, sign
       await log.append({ type: "blob-pending", data: { key, name, mime, size: frame.size } });
       return;
     } catch {
-      // Duplicate id or unsupported — fall through to the inline path.
+      // Unsupported, or refused. The inline path still works.
     }
   }
 

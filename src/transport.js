@@ -89,13 +89,13 @@ const HANDSHAKE_MS = 3000;
  */
 async function handshake(url, signal) {
   const transport = new WebTransport(url);
-  let timer;
+  // AbortSignal.timeout measures active time, so it does not fire against a
+  // suspended worker or a bfcached document the way a bare timer would.
+  const deadline = AbortSignal.timeout(HANDSHAKE_MS);
   try {
     await Promise.race([
       transport.ready,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("webtransport handshake timed out")), HANDSHAKE_MS);
-      }),
+      new Promise((_, reject) => deadline.addEventListener("abort", () => reject(deadline.reason))),
     ]);
   } catch (err) {
     try {
@@ -104,8 +104,6 @@ async function handshake(url, signal) {
       // never opened
     }
     throw err;
-  } finally {
-    clearTimeout(timer);
   }
   signal?.addEventListener("abort", () => transport.close(), { once: true });
   return transport;

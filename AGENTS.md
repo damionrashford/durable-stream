@@ -35,6 +35,10 @@ Breaking any of these breaks the system silently rather than loudly.
 7. **`requestAnimationFrame` does not fire in a hidden tab.** Anything scheduling
    render work needs a timer fallback.
 
+8. **Adding a page module means adding it to `SHELL`.** Anything left out loads
+   from the network, so the app breaks offline in exactly one place. Bump
+   `VERSION` when shell contents change; entries are served cache-first.
+
 ## Layers
 
 ```
@@ -67,6 +71,7 @@ below, exercise it rather than reasoning about it:
 | retention | append past `RETENTION`, confirm `floor` advances and orphaned payloads are swept |
 | streaming | confirm the first chunk arrives before the last is produced |
 | DOM | test with the tab hidden; `visibilityState` is `hidden` in headless |
+| shell cache | stop the server, reload, confirm the app still boots |
 
 **Service worker updates are the main time sink.** Chrome frequently keeps
 serving an old worker after imported modules change. The reliable escape is a
@@ -100,3 +105,4 @@ dependable, and a wedged profile survives `launch.ts nuke`.
 | Reconnect policy and cursor | `src/app.js` |
 | DOM batching and row cap | `src/app.js` |
 | Retention scheduling, isolation, upstream config | `workers/service-worker.js` |
+| Shell cache contents and version | `workers/service-worker.js` (`SHELL`, `VERSION`) |

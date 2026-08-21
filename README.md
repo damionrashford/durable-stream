@@ -15,6 +15,7 @@ Live: <https://damionrashford.github.io/durable-stream/>
 │  sql("select …")             never names a transport │
 └─────────────────────────┬────────────────────────────┘
 ┌─ service worker ────────▼────────────────────────────┐
+│  shell      Cache Storage — the app loads with no net  │
 │  router     URLPattern → route, HEAD, 405            │
 │  log        IndexedDB, append-only, monotonic ids    │
 │  blobs      OPFS, streamed, gzip'd, resumable        │
@@ -78,6 +79,7 @@ as real once its `blob` event commits.
 | Event log | IndexedDB | the autoIncrement key *is* the cursor; range queries; reachable from the worker |
 | Payloads | OPFS | `createWritable()` is a `WritableStream`, so uploads `pipeTo` disk and never buffer |
 | Read model | SQLite wasm | derived, disposable, rebuilt from the log |
+| App shell | Cache Storage | so there is something to read the log *with* offline |
 
 Retention trims the log to 5000 events and sweeps the payloads those events were the
 only reference to, so both halves stay bounded. `QuotaExceededError` triggers a harder
