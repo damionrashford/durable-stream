@@ -49,6 +49,40 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") flush();
 });
 
+/*
+ * Lifecycle and connectivity, all of which decide when the stream is stale.
+ *
+ * pageshow with persisted=true means the document came back from the bfcache.
+ * It was frozen, not reloaded, so module state survived but the connection did
+ * not necessarily — resyncing from the cursor is cheap and restores nothing if
+ * the connection is in fact still live.
+ *
+ * online/offline replace waiting out a backoff: reconnect the instant the
+ * network returns rather than up to 800ms later, and say so when it goes.
+ */
+addEventListener("pageshow", (event) => {
+  if (event.persisted) connect(cursor);
+});
+
+addEventListener("online", () => connect(cursor));
+
+addEventListener("offline", () => {
+  es?.close();
+  clearTimeout(retry);
+  setStatus("idle", "offline — the log is still readable");
+});
+
+/*
+ * Several paths deliberately swallow rejections because failing them would be
+ * worse than continuing. This is the backstop that keeps them from being
+ * invisible: an error nobody handled still reaches the status line and the
+ * console, rather than only the latter.
+ */
+addEventListener("unhandledrejection", (event) => {
+  console.error("unhandled rejection", event.reason);
+  setStatus("error", String(event.reason?.message ?? event.reason).slice(0, 80));
+});
+
 function flush() {
   scheduled = 0;
   if (!staged) return;
