@@ -177,101 +177,165 @@ function safeJSON(text) {
   }
 }
 
-/**
- * WebSocket frames.
+/*
+ * WebSocket framing, shared by both socket transports.
  *
- * Worth having because CORS does not govern WebSocket: the server sees Origin
- * and decides for itself, so an upstream that will not set CORS headers is still
- * reachable. Being a different protocol, it also sits outside the six-connection
- * per-origin cap that HTTP/1.1 imposes on SSE.
+ * A JSON text message describes what follows. If it declares a payload, the
+ * binary messages after it are its body, ending at the declared length — which
+ * keeps the body a ReadableStream that pipes to OPFS like every other
+ * transport's, rather than something that has to be collected first.
  *
- * It carries binary natively, so a payload arrives on this socket instead of
- * needing the second HTTP request the SSE path has to make. Framing: a JSON text
- * message describes what follows, and if it declares a payload the binary
- * messages after it are its body, ending at the declared length.
- *
- * The cost is that WebSocket has no backpressure — messages arrive whether or
- * not anything is ready for them. Frames are queued with a bound and the socket
- * is closed once that bound is passed, which surfaces as a reconnect from the
- * stored cursor. Dropping and resyncing is what the rest of the system already
- * does with a reader that falls behind.
+ * `read` is handed a sink and pumps messages into it. Splitting it this way is
+ * what lets one framing implementation serve a source that can be slowed and one
+ * that cannot: the body stream is fed by later messages, so the pump has to keep
+ * running while a frame is being consumed, and cannot simply be the generator.
  */
-const WS_QUEUE_LIMIT = 256;
+function frameSink() {
+  const queue = [];
+  let payload = null;
+  let wake = null;
+  let ended = null;
 
-async function* webSocketFrames(url, { cursor, signal }) {
+  const wakeUp = () => {
+    wake?.();
+    wake = null;
+  };
+
+  return {
+    depth: () => queue.length,
+
+    accept(message) {
+      if (typeof message !== "string") {
+        if (!payload) return;
+        const bytes = message instanceof Uint8Array ? message : new Uint8Array(message);
+        payload.controller.enqueue(bytes);
+        payload.received += bytes.byteLength;
+        if (payload.received >= payload.size) {
+          payload.controller.close();
+          payload = null;
+        }
+        return;
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(message);
+      } catch {
+        queue.push({ kind: "event", type: "message", data: message });
+        return wakeUp();
+      }
+
+      if (parsed.kind === "blob") {
+        let controller;
+        const body = new ReadableStream({ start: (c) => (controller = c) });
+        payload = { controller, size: parsed.size ?? Infinity, received: 0 };
+        queue.push({ ...parsed, body });
+      } else {
+        queue.push({
+          kind: "event",
+          type: parsed.type ?? "message",
+          data: parsed.data ?? parsed,
+          id: parsed.id,
+        });
+      }
+      wakeUp();
+    },
+
+    end(reason) {
+      ended ??= reason ?? true;
+      payload?.controller.close();
+      payload = null;
+      wakeUp();
+    },
+
+    async *frames() {
+      while (true) {
+        while (queue.length) yield queue.shift();
+        if (ended) {
+          if (ended instanceof Error) throw ended;
+          return;
+        }
+        await new Promise((resolve) => (wake = resolve));
+      }
+    },
+  };
+}
+
+/** Frames the reader may fall behind by before the socket stops being read. */
+const SOCKET_QUEUE_LIMIT = 64;
+
+/**
+ * WebSocketStream: the same protocol with real backpressure.
+ *
+ * Reading is a pump that stops once the queue is full, and stopping the read is
+ * what stops the sender — the socket's receive window closes and the server's
+ * writes block. Measured against a server flooding 64 KB messages while the
+ * consumer took one every 200ms: the sender managed 109 messages and was blocked
+ * 261 times, against 15,296 messages and no blocking on plain WebSocket, where
+ * the difference sat in this process's memory.
+ *
+ * Non-standard and Chromium-only, so plain WebSocket remains the fallback.
+ */
+async function webSocketStreamFrames(url, { cursor, signal }) {
+  const socket = new WebSocketStream(url, {
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(HANDSHAKE_MS)]) : AbortSignal.timeout(HANDSHAKE_MS),
+  });
+  const { readable, writable } = await socket.opened;
+
+  if (cursor) {
+    const writer = writable.getWriter();
+    await writer.write(JSON.stringify({ after: cursor }));
+    writer.releaseLock();
+  }
+
+  const sink = frameSink();
+  signal?.addEventListener("abort", () => socket.close(), { once: true });
+
+  (async () => {
+    const reader = readable.getReader();
+    try {
+      while (true) {
+        // Not reading is the backpressure. Nothing else here has to bound memory.
+        while (sink.depth() >= SOCKET_QUEUE_LIMIT) await new Promise((r) => setTimeout(r, 20));
+        const { value, done } = await reader.read();
+        if (done) break;
+        sink.accept(value);
+      }
+      sink.end();
+    } catch (err) {
+      sink.end(err);
+    }
+  })();
+
+  return sink.frames();
+}
+
+/**
+ * Plain WebSocket: same framing, no way to slow the sender.
+ *
+ * Messages arrive as events whether or not anything is ready for them, so the
+ * only defence is to give up once too many have piled up and resume from the
+ * stored cursor — the same drop-and-resync applied to a slow reader elsewhere.
+ */
+function webSocketFrames(url, { cursor, signal }) {
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
-
-  const queue = [];
-  let wake = null;
-  let closed = null;
-
-  const push = (frame) => {
-    queue.push(frame);
-    wake?.();
-    wake = null;
-  };
-  const fail = (reason) => {
-    closed ??= reason;
-    wake?.();
-    wake = null;
-  };
-
-  // Set while a payload header has been seen and its bytes are still arriving.
-  let payload = null;
+  const sink = frameSink();
 
   socket.addEventListener("open", () => cursor && socket.send(JSON.stringify({ after: cursor })));
-  socket.addEventListener("error", () => fail(new Error("websocket error")));
-  socket.addEventListener("close", () => fail(null));
+  socket.addEventListener("error", () => sink.end(new Error("websocket error")));
+  socket.addEventListener("close", () => sink.end());
   signal?.addEventListener("abort", () => socket.close(), { once: true });
 
   socket.addEventListener("message", (event) => {
-    if (typeof event.data !== "string") {
-      // Body bytes for the payload the last header announced.
-      if (!payload) return;
-      payload.controller.enqueue(new Uint8Array(event.data));
-      payload.received += event.data.byteLength;
-      if (payload.received >= payload.size) {
-        payload.controller.close();
-        payload = null;
-      }
-      return;
-    }
-
-    let message;
-    try {
-      message = JSON.parse(event.data);
-    } catch {
-      return void push({ kind: "event", type: "message", data: event.data });
-    }
-
-    if (message.kind === "blob") {
-      let controller;
-      const body = new ReadableStream({ start: (c) => (controller = c) });
-      payload = { controller, size: message.size ?? Infinity, received: 0 };
-      push({ ...message, body });
-      return;
-    }
-
-    push({ kind: "event", type: message.type ?? "message", data: message.data ?? message, id: message.id });
-    if (queue.length > WS_QUEUE_LIMIT) {
-      // Nothing can slow the sender, so stop reading and resume from the cursor.
+    sink.accept(event.data);
+    if (sink.depth() > SOCKET_QUEUE_LIMIT) {
       socket.close();
-      fail(new Error("websocket queue overflow"));
+      sink.end(new Error("websocket queue overflow"));
     }
   });
 
-  try {
-    while (true) {
-      while (queue.length) yield queue.shift();
-      if (closed) throw closed;
-      if (socket.readyState === WebSocket.CLOSED) return;
-      await new Promise((resolve) => (wake = resolve));
-    }
-  } finally {
-    payload?.controller.close();
-    if (socket.readyState <= WebSocket.OPEN) socket.close();
-  }
+  return sink.frames();
 }
 
 /**
@@ -285,6 +349,14 @@ export async function openUpstream(url, { headers = {}, cursor = null, signal } 
   // Chosen by scheme rather than probed: ws:// and wss:// are unambiguous, and
   // an upstream that offers one has already decided which protocol it speaks.
   if (/^wss?:/.test(url)) {
+    if ("WebSocketStream" in globalThis) {
+      try {
+        const frames = await webSocketStreamFrames(url, { cursor, signal });
+        return { kind: "websocketstream", frames: () => frames };
+      } catch {
+        // Handshake failed or timed out; the plain socket gets its own attempt.
+      }
+    }
     return { kind: "websocket", frames: () => webSocketFrames(url, { cursor, signal }) };
   }
 

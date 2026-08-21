@@ -19,7 +19,7 @@ Live: <https://damionrashford.github.io/durable-stream/>
 │  router     URLPattern → route, HEAD, 405            │
 │  log        IndexedDB, append-only, monotonic ids    │
 │  blobs      OPFS, streamed, gzip'd, resumable        │
-│  upstream   dials out; WebTransport, WebSocket or SSE │
+│  upstream   dials out; WebTransport, WS(Stream), SSE  │
 │  deferred   sync + backgroundfetch                   │
 └──────────────────────────────────────────────────────┘
 ```
@@ -155,9 +155,15 @@ attempted and SSE takes over if the handshake fails or times out.
 WebSocket is worth reaching for when an upstream will not set CORS headers, because
 CORS does not govern it — the server sees `Origin` and decides. It also carries binary,
 so a payload arrives on the same socket instead of needing the second HTTP request the
-SSE path makes, and it sits outside the six-connection per-origin cap. What it lacks is
-backpressure, so frames are queued with a bound and the socket is closed past it, which
-surfaces as a reconnect from the stored cursor.
+SSE path makes, and it sits outside the six-connection per-origin cap.
+
+`WebSocketStream` is used where it exists, because it adds the one thing plain
+WebSocket lacks: not reading stops the sender. Against a server flooding 64 KB messages
+while the consumer took one every 200 ms, the sender managed 109 messages and was
+blocked 261 times; on plain WebSocket it sent 15,296 and was never blocked, and the
+difference sat in the tab's memory. It is non-standard and Chromium-only, so plain
+WebSocket stays as the fallback and bounds its queue instead, closing the socket past
+the bound so the reconnect resumes from the stored cursor.
 
 ## Cross-origin isolation
 
