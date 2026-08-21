@@ -22,9 +22,57 @@ function setStatus(state, text) {
 // idempotent over it.
 const rendered = new Set();
 
+/** Rows kept in the DOM. The log retains far more; this is a viewport, not storage. */
+const MAX_ROWS = 500;
+
+/*
+ * Replaying a log delivers hundreds of events in a burst, one message at a time.
+ * Appending each one directly would mean a layout pass per event. Rows are staged
+ * in a DocumentFragment and inserted once per frame instead — a fragment is not
+ * part of the document, so building it costs nothing.
+ */
+let staged = null;
+let scheduled = 0;
+
+/*
+ * requestAnimationFrame does not fire in a hidden tab, so scheduling on it alone
+ * means a backgrounded tab renders nothing and stages rows forever. Frames when
+ * visible, a timer when not, and a flush the moment visibility returns.
+ */
+function schedule() {
+  if (scheduled) return;
+  scheduled =
+    document.visibilityState === "visible" ? requestAnimationFrame(flush) : setTimeout(flush, 250);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") flush();
+});
+
+function flush() {
+  scheduled = 0;
+  if (!staged) return;
+  feed.append(staged);
+  staged = null;
+
+  // Trim from the front. Ids only grow, so the oldest rows are the first ones.
+  while (feed.childElementCount > MAX_ROWS) feed.firstElementChild.remove();
+
+  // Once per flush rather than once per row: scrollIntoView forces layout.
+  feed.lastElementChild?.scrollIntoView({ block: "nearest" });
+}
+
 function row(id, type) {
   if (rendered.has(id)) return null;
   rendered.add(id);
+  // Bounded alongside the DOM: replay only moves forward from a cursor, so an id
+  // old enough to be forgotten here is old enough never to arrive again.
+  if (rendered.size > MAX_ROWS * 4) {
+    for (const old of rendered) {
+      rendered.delete(old);
+      if (rendered.size <= MAX_ROWS * 2) break;
+    }
+  }
 
   const li = document.createElement("li");
   for (const [cls, text] of [["id", id], ["name", type]]) {
@@ -36,10 +84,24 @@ function row(id, type) {
   const body = document.createElement("span");
   body.className = "body";
   li.append(body);
-  feed.append(li);
-  li.scrollIntoView({ block: "nearest" });
+
+  staged ??= new DocumentFragment();
+  staged.append(li);
+  schedule();
   return body;
 }
+
+/*
+ * One listener for every payload button, on the container.
+ *
+ * A listener per row would mean a closure per row held alive by the DOM; with the
+ * feed trimming and refilling, delegation keeps that at exactly one.
+ */
+feed.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-pull]");
+  if (!button) return;
+  pull(button.dataset.pull, button.closest("li").querySelector(".body"));
+});
 
 /* ── control plane ───────────────────────────────────────────────────────── */
 
@@ -81,8 +143,8 @@ function connect(from = cursor) {
     if (type === "blob") {
       const btn = document.createElement("button");
       btn.className = "link";
+      btn.dataset.pull = data.key; // delegated; no per-row listener
       btn.textContent = `${data.name} · ${data.size} B · pull`;
-      btn.addEventListener("click", () => pull(data, body));
       body.append(btn);
     } else {
       body.textContent = JSON.stringify(data);
@@ -116,11 +178,11 @@ navigator.serviceWorker.addEventListener("message", async (event) => {
   await render(body, msg);
 });
 
-function pull(meta, body) {
+function pull(key, body) {
   body.replaceChildren();
   body.textContent = "pulling…";
-  pending.set(meta.key, body);
-  navigator.serviceWorker.controller?.postMessage({ type: "pull", key: meta.key });
+  pending.set(key, body);
+  navigator.serviceWorker.controller?.postMessage({ type: "pull", key });
 }
 
 /* ── boot ────────────────────────────────────────────────────────────────── */

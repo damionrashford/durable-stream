@@ -53,8 +53,15 @@ const request = (req) =>
     req.onerror = () => reject(req.error);
   });
 
+/*
+ * QuotaExceededError is now its own DOMException subclass carrying `quota` and
+ * `requested`, but was a plain DOMException before that, and IndexedDB nests the
+ * real error under `inner`. All three shapes have to be recognised.
+ */
 const isQuota = (err) =>
-  err?.name === "QuotaExceededError" || err?.inner?.name === "QuotaExceededError";
+  (typeof QuotaExceededError !== "undefined" && err instanceof QuotaExceededError) ||
+  err?.name === "QuotaExceededError" ||
+  err?.inner?.name === "QuotaExceededError";
 
 export async function openLog() {
   const db = await open();
@@ -83,7 +90,15 @@ export async function openLog() {
         // caller has to deal with it rather than us silently dropping data.
         if (!retry || !isQuota(err)) throw err;
         await api.trim(PANIC_RETENTION);
-        return api.append(entry, { retry: false });
+        const room = await api.append(entry, { retry: false });
+        // The subclass reports what was asked for and what the cap is; worth
+        // recording, since hitting it again means trimming is not enough.
+        if (err.quota !== undefined) {
+          api.append({ type: "quota", data: { quota: err.quota, requested: err.requested } }).catch(
+            () => {},
+          );
+        }
+        return room;
       }
 
       const event = { id, type: entry.type, data: entry.data ?? null };
