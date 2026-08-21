@@ -1,0 +1,157 @@
+:root {
+  --bg: #0a0c0b;
+  --panel: #10130f;
+  --ink: #c8d3cc;
+  --dim: #5d6b63;
+  --live: #4ade80;
+  --wait: #eab308;
+  --dead: #64748b;
+  --err: #f87171;
+  --rule: #1c221f;
+}
+
+* { box-sizing: border-box; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.55 "JetBrains Mono", ui-monospace, Menlo, monospace;
+  padding: clamp(2rem, 6vh, 4rem) 1.25rem;
+  background-image: repeating-linear-gradient(
+    to bottom, rgba(255, 255, 255, .012) 0 1px, transparent 1px 3px
+  );
+}
+
+main { max-width: 52rem; margin: 0 auto; }
+
+h1 {
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+  color: #fff;
+}
+
+.lede { color: var(--dim); font-size: .8rem; margin: .4rem 0 1.5rem; max-width: 44rem; }
+code { color: var(--live); }
+
+/* ── status bar ──────────────────────────────────────────── */
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding-bottom: .85rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.status {
+  font-size: .72rem;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--dim);
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+}
+.status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.status[data-state="live"] { color: var(--live); }
+.status[data-state="live"]::before { animation: pulse 1.6s ease-in-out infinite; }
+.status[data-state="wait"] { color: var(--wait); }
+.status[data-state="idle"] { color: var(--dead); }
+.status[data-state="error"] { color: var(--err); }
+@keyframes pulse { 50% { opacity: .25; } }
+
+.meta { margin-left: auto; font-size: .72rem; color: var(--dim); }
+
+/* ── deck ────────────────────────────────────────────────── */
+
+.deck { display: grid; grid-template-columns: 1fr auto; gap: 1rem; padding: 1rem 0; align-items: stretch; }
+@media (max-width: 44rem) { .deck { grid-template-columns: 1fr; } }
+
+.drop {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: .3rem;
+  padding: 1.1rem 1.25rem;
+  border: 1px dashed var(--rule);
+  border-radius: 4px;
+  background: var(--panel);
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.drop:hover, .drop[data-over] { border-color: var(--live); background: #101a12; }
+.drop span { font-size: .82rem; }
+.drop small { color: var(--dim); font-size: .72rem; }
+
+.ops { display: flex; flex-direction: column; gap: .4rem; justify-content: center; }
+
+button {
+  font: inherit;
+  font-size: .72rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: .42rem 1rem;
+  border-radius: 3px;
+  border: 1px solid var(--rule);
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+}
+button:hover { border-color: var(--live); color: #fff; }
+button.danger:hover { border-color: var(--err); color: var(--err); }
+button:focus-visible { outline: 2px solid var(--live); outline-offset: 1px; }
+
+button.link {
+  text-transform: none;
+  letter-spacing: 0;
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--live);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+a.link { color: var(--live); text-underline-offset: 2px; }
+
+/* ── feed ────────────────────────────────────────────────── */
+
+.feed { list-style: none; padding: 0; border-top: 1px solid var(--rule); }
+
+.feed li {
+  display: grid;
+  grid-template-columns: 3rem 5.5rem 1fr;
+  gap: 1rem;
+  padding: .5rem 0;
+  border-bottom: 1px solid var(--rule);
+  animation: in .2s ease-out;
+}
+@keyframes in { from { opacity: 0; transform: translateY(-3px); } }
+
+.feed .id { color: var(--dim); text-align: right; font-size: .76rem; }
+.feed .name { color: var(--live); font-size: .76rem; }
+.feed .body { font-size: .8rem; overflow-wrap: anywhere; display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+
+.feed li[data-kind="meta"] .name,
+.feed li[data-kind="meta"] .body { color: var(--dim); font-style: italic; }
+.feed li[data-kind="blob"] .name { color: var(--wait); }
+
+.feed img {
+  max-width: 12rem;
+  max-height: 8rem;
+  border-radius: 3px;
+  border: 1px solid var(--rule);
+  display: block;
+}
+
+.good { color: var(--live); }
+.bad { color: var(--err); font-weight: 700; }
+
+@media (max-width: 34rem) {
+  .feed li { grid-template-columns: 2.5rem 1fr; }
+  .feed .body { grid-column: 1 / -1; }
+}

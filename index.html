@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Durable stream</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles/main.css">
+</head>
+<body>
+
+<main>
+  <header>
+    <h1>Durable stream</h1>
+    <p class="lede">No backend. A service worker answers <code>/api/*</code> from inside
+    the browser. The log is the source of truth; the connection is disposable.</p>
+  </header>
+
+  <div class="bar">
+    <span class="status" id="status" data-state="idle">booting</span>
+    <span class="meta" id="storage"></span>
+  </div>
+
+  <section class="deck">
+    <label class="drop" id="drop">
+      <input type="file" id="file" hidden multiple>
+      <span>Drop a file, or click</span>
+      <small>bytes go page → OPFS → back as a transferred stream. never base64.</small>
+    </label>
+
+    <div class="ops">
+      <button id="ping">append event</button>
+      <button id="replay">replay from 0</button>
+      <button id="kill">drop connection</button>
+      <button id="wipe" class="danger">wipe log</button>
+    </div>
+  </section>
+
+  <ol class="feed" id="feed" aria-live="polite"></ol>
+</main>
+
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
