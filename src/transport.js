@@ -178,6 +178,103 @@ function safeJSON(text) {
 }
 
 /**
+ * WebSocket frames.
+ *
+ * Worth having because CORS does not govern WebSocket: the server sees Origin
+ * and decides for itself, so an upstream that will not set CORS headers is still
+ * reachable. Being a different protocol, it also sits outside the six-connection
+ * per-origin cap that HTTP/1.1 imposes on SSE.
+ *
+ * It carries binary natively, so a payload arrives on this socket instead of
+ * needing the second HTTP request the SSE path has to make. Framing: a JSON text
+ * message describes what follows, and if it declares a payload the binary
+ * messages after it are its body, ending at the declared length.
+ *
+ * The cost is that WebSocket has no backpressure — messages arrive whether or
+ * not anything is ready for them. Frames are queued with a bound and the socket
+ * is closed once that bound is passed, which surfaces as a reconnect from the
+ * stored cursor. Dropping and resyncing is what the rest of the system already
+ * does with a reader that falls behind.
+ */
+const WS_QUEUE_LIMIT = 256;
+
+async function* webSocketFrames(url, { cursor, signal }) {
+  const socket = new WebSocket(url);
+  socket.binaryType = "arraybuffer";
+
+  const queue = [];
+  let wake = null;
+  let closed = null;
+
+  const push = (frame) => {
+    queue.push(frame);
+    wake?.();
+    wake = null;
+  };
+  const fail = (reason) => {
+    closed ??= reason;
+    wake?.();
+    wake = null;
+  };
+
+  // Set while a payload header has been seen and its bytes are still arriving.
+  let payload = null;
+
+  socket.addEventListener("open", () => cursor && socket.send(JSON.stringify({ after: cursor })));
+  socket.addEventListener("error", () => fail(new Error("websocket error")));
+  socket.addEventListener("close", () => fail(null));
+  signal?.addEventListener("abort", () => socket.close(), { once: true });
+
+  socket.addEventListener("message", (event) => {
+    if (typeof event.data !== "string") {
+      // Body bytes for the payload the last header announced.
+      if (!payload) return;
+      payload.controller.enqueue(new Uint8Array(event.data));
+      payload.received += event.data.byteLength;
+      if (payload.received >= payload.size) {
+        payload.controller.close();
+        payload = null;
+      }
+      return;
+    }
+
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return void push({ kind: "event", type: "message", data: event.data });
+    }
+
+    if (message.kind === "blob") {
+      let controller;
+      const body = new ReadableStream({ start: (c) => (controller = c) });
+      payload = { controller, size: message.size ?? Infinity, received: 0 };
+      push({ ...message, body });
+      return;
+    }
+
+    push({ kind: "event", type: message.type ?? "message", data: message.data ?? message, id: message.id });
+    if (queue.length > WS_QUEUE_LIMIT) {
+      // Nothing can slow the sender, so stop reading and resume from the cursor.
+      socket.close();
+      fail(new Error("websocket queue overflow"));
+    }
+  });
+
+  try {
+    while (true) {
+      while (queue.length) yield queue.shift();
+      if (closed) throw closed;
+      if (socket.readyState === WebSocket.CLOSED) return;
+      await new Promise((resolve) => (wake = resolve));
+    }
+  } finally {
+    payload?.controller.close();
+    if (socket.readyState <= WebSocket.OPEN) socket.close();
+  }
+}
+
+/**
  * Try WebTransport, fall back to SSE.
  *
  * Detection is a real connection attempt, not a feature check: the API can exist
@@ -185,6 +282,12 @@ function safeJSON(text) {
  * Returns which one won so it can be surfaced.
  */
 export async function openUpstream(url, { headers = {}, cursor = null, signal } = {}) {
+  // Chosen by scheme rather than probed: ws:// and wss:// are unambiguous, and
+  // an upstream that offers one has already decided which protocol it speaks.
+  if (/^wss?:/.test(url)) {
+    return { kind: "websocket", frames: () => webSocketFrames(url, { cursor, signal }) };
+  }
+
   if ("WebTransport" in globalThis) {
     try {
       const transport = await handshake(url, signal);

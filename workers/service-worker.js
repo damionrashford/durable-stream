@@ -42,7 +42,7 @@ const OUTBOX_TAG = "outbox";
  * fails before any of this runs. Bump VERSION to invalidate; entries are
  * served cache-first, so an edit is otherwise invisible to a controlled page.
  */
-const VERSION = "shell-v2";
+const VERSION = "shell-v3";
 const SHELL = [
   "./",
   "./index.html",

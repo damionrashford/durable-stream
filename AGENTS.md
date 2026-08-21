@@ -109,7 +109,7 @@ dependable, and a wedged profile survives `launch.ts nuke`.
 | Retention size and quota response | `src/log.js` |
 | Compression threshold, range slicing | `src/blobs.js` |
 | Resumable threshold, Background Fetch threshold | `src/upstream.js` |
-| Transport choice and handshake timeout | `src/transport.js` |
+| Transport choice, handshake timeout, WS queue bound | `src/transport.js` |
 | Reconnect policy and cursor | `src/app.js` |
 | DOM batching and row cap | `src/app.js` |
 | Retention scheduling, isolation, upstream config | `workers/service-worker.js` |

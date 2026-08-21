@@ -19,7 +19,7 @@ Live: <https://damionrashford.github.io/durable-stream/>
 │  router     URLPattern → route, HEAD, 405            │
 │  log        IndexedDB, append-only, monotonic ids    │
 │  blobs      OPFS, streamed, gzip'd, resumable        │
-│  upstream   dials out; WebTransport or SSE           │
+│  upstream   dials out; WebTransport, WebSocket or SSE │
 │  deferred   sync + backgroundfetch                   │
 └──────────────────────────────────────────────────────┘
 ```
@@ -149,8 +149,15 @@ Set `UPSTREAM` in [workers/service-worker.js](workers/service-worker.js). The pa
 cannot push into it. The worker dials out instead and appends what arrives to the log
 every tab already reads — one socket feeding N tabs.
 
-Transport is picked by a real connection attempt, not a feature check: WebTransport
-first, SSE if the handshake fails or times out.
+A `ws://` or `wss://` URL selects the WebSocket transport; otherwise WebTransport is
+attempted and SSE takes over if the handshake fails or times out.
+
+WebSocket is worth reaching for when an upstream will not set CORS headers, because
+CORS does not govern it — the server sees `Origin` and decides. It also carries binary,
+so a payload arrives on the same socket instead of needing the second HTTP request the
+SSE path makes, and it sits outside the six-connection per-origin cap. What it lacks is
+backpressure, so frames are queued with a bound and the socket is closed past it, which
+surfaces as a reconnect from the stored cursor.
 
 ## Cross-origin isolation
 
