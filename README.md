@@ -100,8 +100,15 @@ scripts/dev-server.ts
 bun scripts/dev-server.ts
 ```
 
-Then <http://localhost:4321>. Open a second tab — one worker, one log, both tabs
-live. Hit **drop connection** and watch it resume at its cursor instead of replaying.
+Then <http://localhost:4321>. The page is a viewer; produce from the console:
+
+```js
+stream.append("note", { text: "hi" })
+stream.put(new File(["hello"], "a.txt", { type: "text/plain" }))
+```
+
+Open a second tab — one worker, one log, both live. Hit **drop connection** and watch
+it resume at its cursor instead of replaying.
 
 ## Deploying to GitHub Pages
 

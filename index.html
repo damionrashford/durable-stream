@@ -23,20 +23,22 @@
     <span class="meta" id="storage"></span>
   </div>
 
-  <section class="deck">
-    <label class="drop" id="drop">
-      <input type="file" id="file" hidden multiple>
-      <span>Drop a file, or click</span>
-      <small>bytes go page → OPFS → back as a transferred stream. never base64.</small>
-    </label>
+  <dl class="endpoints">
+    <dt>stream</dt>
+    <dd><button class="copy" id="ep-get" title="copy">…</button></dd>
+    <dt>append</dt>
+    <dd><button class="copy" id="ep-post" title="copy">…</button></dd>
+  </dl>
+  <p class="caveat">These resolve on this origin only. The worker sits between this page
+  and the network, not on it — <code>curl</code> that URL and the static host answers 404.
+  Produce from the console: <code>stream.append("note", {text:"hi"})</code> or
+  <code>stream.put(file)</code>.</p>
 
-    <div class="ops">
-      <button id="ping">append event</button>
-      <button id="replay">replay from 0</button>
-      <button id="kill">drop connection</button>
-      <button id="wipe" class="danger">wipe log</button>
-    </div>
-  </section>
+  <div class="ops">
+    <button id="replay">replay from 0</button>
+    <button id="kill">drop connection</button>
+    <button id="wipe" class="danger">wipe log</button>
+  </div>
 
   <ol class="feed" id="feed" aria-live="polite"></ol>
 </main>

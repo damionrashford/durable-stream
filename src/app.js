@@ -73,7 +73,9 @@ const advance = (e) => {
 function connect(from = cursor) {
   clearTimeout(retry);
   es?.close();
-  es = new EventSource(api(`api/events?after=${from}`));
+  const url = api(`api/events?after=${from}`);
+  $("ep-get").textContent = url;
+  es = new EventSource(url);
 
   es.addEventListener("open", () => setStatus("live", "live"));
 
@@ -163,49 +165,45 @@ function pull(meta, slot) {
 
 /* ── producing ───────────────────────────────────────────────────────────── */
 
-async function upload(file) {
-  const key = crypto.randomUUID();
-  // SubtleCrypto has no streaming digest, so this one read is unavoidable if we
-  // want an end-to-end integrity check. The upload itself still streams.
-  const hash = await sha256(await file.arrayBuffer());
+/**
+ * The producer side is an API, not UI. Call it from the console; the result comes
+ * back over the stream like anything else, in this tab and every other one.
+ *
+ *   stream.append("note", { text: "hi" })
+ *   stream.put(new File(["hello"], "a.txt", { type: "text/plain" }))
+ */
+globalThis.stream = {
+  append: (type, data) =>
+    fetch(api("api/events"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type, data }),
+    }).then((r) => r.json()),
 
-  // A File is a Blob, so fetch streams it as the body — no duplex flag needed and
-  // nothing is buffered on the way to OPFS.
-  await fetch(api(`api/blob/${key}`), {
-    method: "PUT",
-    headers: { "x-name": file.name, "x-mime": file.type || "application/octet-stream", "x-sha256": hash },
-    body: file,
-  });
-  // No local render: the event comes back over the stream, same as every other tab.
-}
+  async put(file) {
+    const key = crypto.randomUUID();
+    // SubtleCrypto has no streaming digest, so this one read is the price of an
+    // end-to-end integrity check. The upload itself still streams.
+    const sha = await sha256(await file.arrayBuffer());
 
-$("file").addEventListener("change", (e) => {
-  for (const file of e.target.files) upload(file);
-  e.target.value = "";
-});
+    // A File is a Blob, so fetch streams it as the body — no duplex flag needed,
+    // and nothing is buffered on the way to OPFS.
+    const res = await fetch(api(`api/blob/${key}`), {
+      method: "PUT",
+      headers: {
+        "x-name": file.name,
+        "x-mime": file.type || "application/octet-stream",
+        "x-sha256": sha,
+      },
+      body: file,
+    });
+    return res.json();
+  },
 
-const drop = $("drop");
-for (const type of ["dragenter", "dragover"]) {
-  drop.addEventListener(type, (e) => {
-    e.preventDefault();
-    drop.dataset.over = "true";
-  });
-}
-for (const type of ["dragleave", "drop"]) {
-  drop.addEventListener(type, () => delete drop.dataset.over);
-}
-drop.addEventListener("drop", (e) => {
-  e.preventDefault();
-  for (const file of e.dataTransfer.files) upload(file);
-});
-
-$("ping").addEventListener("click", () =>
-  fetch(api("api/events"), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ type: "note", data: { text: `hello from a tab at ${new Date().toLocaleTimeString()}` } }),
-  }),
-);
+  get cursor() {
+    return cursor;
+  },
+};
 
 $("replay").addEventListener("click", () => {
   feed.replaceChildren();
@@ -232,6 +230,16 @@ $("wipe").addEventListener("click", async () => {
 });
 
 /* ── boot ────────────────────────────────────────────────────────────────── */
+
+$("ep-post").textContent = api("api/events");
+
+for (const id of ["ep-get", "ep-post"]) {
+  $(id).addEventListener("click", async (e) => {
+    await navigator.clipboard.writeText(e.currentTarget.textContent).catch(() => {});
+    e.currentTarget.dataset.copied = "true";
+    setTimeout(() => delete e.currentTarget.dataset.copied, 1200);
+  });
+}
 
 function awaitController(timeout = 3000) {
   if (navigator.serviceWorker.controller) return Promise.resolve(true);
