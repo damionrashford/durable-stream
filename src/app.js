@@ -1,9 +1,7 @@
 /*
- * Page side. It talks to /api/* and never learns which runtime answered — service
- * worker today, edge worker later, same code.
- *
- * Control plane: EventSource over /api/events. Text, resumable, auto-reconnecting.
- * Data plane:    transferable ReadableStreams over postMessage. Binary, backpressured.
+ * Page side. It talks to /api/* and never touches the worker directly, except on
+ * the data plane — where the worker transfers a live ReadableStream over
+ * postMessage rather than encoding bytes into the text stream.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -21,35 +19,23 @@ function setStatus(state, text) {
 // idempotent over it.
 const rendered = new Set();
 
-function row(kind, id, name, body) {
-  if (id) {
-    if (rendered.has(id)) return null;
-    rendered.add(id);
-  }
+function row(id, type) {
+  if (rendered.has(id)) return null;
+  rendered.add(id);
+
   const li = document.createElement("li");
-  li.dataset.kind = kind;
-  for (const [cls, text] of [["id", id], ["name", name]]) {
+  for (const [cls, text] of [["id", id], ["name", type]]) {
     const span = document.createElement("span");
     span.className = cls;
     span.textContent = text;
     li.append(span);
   }
-  const slot = document.createElement("span");
-  slot.className = "body";
-  if (body instanceof Node) slot.append(body);
-  else slot.textContent = body ?? "";
-  li.append(slot);
+  const body = document.createElement("span");
+  body.className = "body";
+  li.append(body);
   feed.append(li);
   li.scrollIntoView({ block: "nearest" });
-  return slot;
-}
-
-const bytes = (n) =>
-  n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
-
-async function sha256(buffer) {
-  const digest = await crypto.subtle.digest("SHA-256", buffer);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return body;
 }
 
 /* ── control plane ───────────────────────────────────────────────────────── */
@@ -57,11 +43,6 @@ async function sha256(buffer) {
 let es = null;
 let cursor = 0; // highest id this tab has seen; the resume point
 let retry = null;
-
-const advance = (e) => {
-  const id = Number.parseInt(e.lastEventId, 10);
-  if (Number.isFinite(id) && id > cursor) cursor = id;
-};
 
 /**
  * We drive reconnection ourselves rather than letting EventSource do it.
@@ -73,39 +54,31 @@ const advance = (e) => {
 function connect(from = cursor) {
   clearTimeout(retry);
   es?.close();
+
   const url = api(`api/events?after=${from}`);
   $("ep-get").textContent = url;
   es = new EventSource(url);
 
   es.addEventListener("open", () => setStatus("live", "live"));
 
-  es.addEventListener("caught-up", (e) => {
-    const { resumeFrom, through, sawHeader } = JSON.parse(e.data);
-    row(
-      "meta",
-      "",
-      "caught-up",
-      `resumed at ${resumeFrom} → ${through} · Last-Event-ID header: ${sawHeader ?? "absent"}`,
-    );
-    setStatus("live", "live");
-  });
+  es.onmessage = (e) => {
+    const id = Number.parseInt(e.lastEventId, 10);
+    if (Number.isFinite(id) && id > cursor) cursor = id;
 
-  es.addEventListener("note", (e) => {
-    advance(e);
-    row("event", e.lastEventId, "note", JSON.parse(e.data)?.text);
-  });
+    const { type, data } = JSON.parse(e.data);
+    const body = row(e.lastEventId, type);
+    if (!body) return;
 
-  es.addEventListener("blob", (e) => {
-    advance(e);
-    const meta = JSON.parse(e.data);
-    const slot = row("blob", e.lastEventId, "blob", "");
-    if (!slot) return; // already rendered
-    const btn = document.createElement("button");
-    btn.className = "link";
-    btn.textContent = `${meta.name} · ${bytes(meta.size)} · pull`;
-    btn.addEventListener("click", () => pull(meta, slot));
-    slot.append(btn);
-  });
+    if (type === "blob") {
+      const btn = document.createElement("button");
+      btn.className = "link";
+      btn.textContent = `${data.name} · ${data.size} B · pull`;
+      btn.addEventListener("click", () => pull(data, body));
+      body.append(btn);
+    } else {
+      body.textContent = JSON.stringify(data);
+    }
+  };
 
   es.onerror = () => {
     setStatus("wait", `reconnecting from ${cursor}`);
@@ -120,120 +93,39 @@ const pending = new Map();
 
 navigator.serviceWorker.addEventListener("message", async (event) => {
   const msg = event.data;
-  const slot = pending.get(msg?.key);
-  if (!slot) return;
+  const body = pending.get(msg?.key);
+  if (!body) return;
   pending.delete(msg.key);
 
   if (msg.type !== "pull-ok") {
-    slot.textContent = "missing";
+    body.textContent = "missing";
     return;
   }
 
-  // msg.stream is a LIVE ReadableStream that was transferred out of the worker.
-  // Response() drains it; the bytes were never text.
+  // msg.stream is a LIVE ReadableStream transferred out of the worker. The bytes
+  // were never text.
   const blob = await new Response(msg.stream).blob();
-  const ok = msg.sha256 ? (await sha256(await blob.arrayBuffer())) === msg.sha256 : null;
-
-  slot.replaceChildren();
-  const verdict = document.createElement("span");
-  verdict.className = ok === false ? "bad" : "good";
-  verdict.textContent = ok === null ? `${bytes(blob.size)}` : ok ? `${bytes(blob.size)} · hash ok` : "HASH MISMATCH";
-  slot.append(verdict);
-
-  const url = URL.createObjectURL(blob);
-  if ((msg.mime ?? "").startsWith("image/")) {
-    const img = document.createElement("img");
-    img.src = url;
-    img.alt = msg.name ?? "";
-    slot.append(img);
-  } else {
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = msg.name ?? msg.key;
-    a.textContent = "download";
-    a.className = "link";
-    slot.append(a);
-  }
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = msg.name ?? msg.key;
+  link.textContent = `${blob.size} B · download`;
+  link.className = "link";
+  body.replaceChildren(link);
 });
 
-function pull(meta, slot) {
-  slot.replaceChildren();
-  slot.textContent = "pulling…";
-  pending.set(meta.key, slot);
+function pull(meta, body) {
+  body.replaceChildren();
+  body.textContent = "pulling…";
+  pending.set(meta.key, body);
   navigator.serviceWorker.controller?.postMessage({ type: "pull", key: meta.key });
 }
-
-/* ── producing ───────────────────────────────────────────────────────────── */
-
-/**
- * The producer side is an API, not UI. Call it from the console; the result comes
- * back over the stream like anything else, in this tab and every other one.
- *
- *   stream.append("note", { text: "hi" })
- *   stream.put(new File(["hello"], "a.txt", { type: "text/plain" }))
- */
-globalThis.stream = {
-  append: (type, data) =>
-    fetch(api("api/events"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ type, data }),
-    }).then((r) => r.json()),
-
-  async put(file) {
-    const key = crypto.randomUUID();
-    // SubtleCrypto has no streaming digest, so this one read is the price of an
-    // end-to-end integrity check. The upload itself still streams.
-    const sha = await sha256(await file.arrayBuffer());
-
-    // A File is a Blob, so fetch streams it as the body — no duplex flag needed,
-    // and nothing is buffered on the way to OPFS.
-    const res = await fetch(api(`api/blob/${key}`), {
-      method: "PUT",
-      headers: {
-        "x-name": file.name,
-        "x-mime": file.type || "application/octet-stream",
-        "x-sha256": sha,
-      },
-      body: file,
-    });
-    return res.json();
-  },
-
-  get cursor() {
-    return cursor;
-  },
-};
-
-$("replay").addEventListener("click", () => {
-  feed.replaceChildren();
-  rendered.clear();
-  cursor = 0;
-  connect(0);
-});
-
-// Killed from the worker side. Ending the stream at the source is the realistic
-// failure — a dropped connection, not a deliberate close — and it exercises the
-// resume path rather than the shutdown path.
-$("kill").addEventListener("click", async () => {
-  row("meta", "", "killed", "stream ended at the source — watch it resume from its cursor");
-  await fetch(api("api/kick"), { method: "POST" });
-});
-
-$("wipe").addEventListener("click", async () => {
-  await fetch(api("api/log"), { method: "DELETE" });
-  feed.replaceChildren();
-  rendered.clear();
-  cursor = 0;
-  connect(0);
-  refreshStorage();
-});
 
 /* ── boot ────────────────────────────────────────────────────────────────── */
 
 $("ep-post").textContent = api("api/events");
+$("ep-blob").textContent = api("api/blob/:key");
 
-for (const id of ["ep-get", "ep-post"]) {
+for (const id of ["ep-get", "ep-post", "ep-blob"]) {
   $(id).addEventListener("click", async (e) => {
     await navigator.clipboard.writeText(e.currentTarget.textContent).catch(() => {});
     e.currentTarget.dataset.copied = "true";
@@ -241,6 +133,8 @@ for (const id of ["ep-get", "ep-post"]) {
   });
 }
 
+// clients.claim() can land before we attach the listener, so poll alongside it —
+// waiting on the event alone hangs when activation is fast.
 function awaitController(timeout = 3000) {
   if (navigator.serviceWorker.controller) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -255,32 +149,22 @@ function awaitController(timeout = 3000) {
   });
 }
 
-async function refreshStorage() {
-  const res = await fetch(api("api/status"));
-  const { head, storage } = await res.json();
-  $("storage").textContent =
-    `head ${head} · ${bytes(storage.usage)} of ${bytes(storage.quota)} · ` +
-    (storage.persisted ? "persisted" : "evictable");
-}
-
 (async () => {
   if (!("serviceWorker" in navigator)) {
     setStatus("error", "no service worker support");
     return;
   }
   try {
-    // Module worker: sw.js imports handler.js, the same file the edge runs.
     // updateViaCache:"none" — the worker imports handler.js and friends; without
     // this the HTTP cache is consulted for those imports and edits go unnoticed.
-    const reg = await navigator.serviceWorker.register(api("sw.js"), {
+    // No update() call here: firing it while the first install is still in flight
+    // aborts that install with an AbortError.
+    await navigator.serviceWorker.register(api("sw.js"), {
       type: "module",
       updateViaCache: "none",
     });
-    reg.update().catch(() => {});
     await navigator.serviceWorker.ready;
 
-    // clients.claim() can land before we attach the listener, so poll alongside it
-    // rather than waiting on the event alone — otherwise a fast activation hangs here.
     if (!(await awaitController())) {
       // Activated too early to ever claim this page. One reload guarantees control.
       if (!sessionStorage.getItem("sw-reload")) {
@@ -298,8 +182,6 @@ async function refreshStorage() {
 
     setStatus("wait", "connecting");
     connect();
-    await refreshStorage();
-    setInterval(refreshStorage, 5000);
   } catch (err) {
     setStatus("error", String(err));
   }
