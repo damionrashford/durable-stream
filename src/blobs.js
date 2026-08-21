@@ -2,17 +2,37 @@
  * Binary payload store, backed by the Origin Private File System.
  *
  * createWritable() returns a FileSystemWritableFileStream, which is a
- * WritableStream, so an incoming body pipes straight to disk with backpressure
- * and a file larger than memory costs nothing to receive. getFile() returns a
- * File, whose .stream() is lazy and whose slices are transferable to a page.
+ * WritableStream, so an incoming body reaches disk with backpressure and a file
+ * larger than memory costs nothing to receive. getFile() returns a File, whose
+ * .stream() is lazy and whose slices are transferable to a page.
  *
  * The API here is the async one. createSyncAccessHandle() is
  * [Exposed=DedicatedWorker], so it is unreachable from a service worker.
+ *
+ * Two directories, because a payload has two identities:
+ *
+ *   staging/<key>    bytes arriving, named by whoever asked for them
+ *   objects/<sha256> bytes at rest, named by what they are
+ *
+ * Content addressing is what makes the same payload announced under three keys
+ * cost one copy. It also means an object cannot be named until its last byte has
+ * been hashed, which is why arrival needs a name of its own — and that name has
+ * to be the caller's key, because a resume must find its own prefix and nothing
+ * else has been established about the bytes yet.
  */
 
 import { hashingStream } from "./sha256.js";
+import { BLOCK_SIZE, gzipMember, encodeTrailer, readTrailer, readBlocks } from "./blocks.js";
 
-const DIR = "blobs";
+const OBJECTS = "objects";
+const STAGING = "staging";
+
+/** Pre-content-addressing layout. Removed on open; the log can re-announce. */
+const LEGACY = "blobs";
+
+/** Suffix marking a block-wise gzip container. See blocks.js. */
+const SUFFIX = ".gzb";
+const ENCODING = "gzip-blocks";
 
 /**
  * Payloads live in their own storage bucket where one is available.
@@ -44,147 +64,299 @@ async function rootDirectory() {
 const COMPRESSIBLE =
   /^(text\/|application\/(json|xml|javascript|x-ndjson|wasm)|image\/svg\+xml)/;
 
-async function openDir() {
-  const root = await rootDirectory();
-  return root.getDirectoryHandle(DIR, { create: true });
+/** getFileHandle throws NotFoundError rather than returning null. */
+async function fileHandle(dir, name) {
+  try {
+    return await dir.getFileHandle(name);
+  } catch {
+    return null;
+  }
 }
 
 export async function openBlobStore() {
-  let store = await openDir();
+  const root = await rootDirectory();
+  await root.removeEntry(LEGACY, { recursive: true }).catch(() => {});
+
+  let objects = await root.getDirectoryHandle(OBJECTS, { create: true });
+  let staging = await root.getDirectoryHandle(STAGING, { create: true });
+
+  /**
+   * Give a finished staging file its content address.
+   *
+   * move() is the only way to do this without reading the payload back — it is
+   * a directory-entry change, so a gigabyte costs what a byte costs. It is
+   * neither universally implemented nor stable, hence the copy behind it, which
+   * is correct and merely expensive.
+   */
+  async function promote(handle, name) {
+    if (typeof handle.move === "function") {
+      try {
+        await handle.move(objects, name);
+        return;
+      } catch {
+        // fall through to the portable path
+      }
+    }
+    const source = await handle.getFile();
+    const target = await objects.getFileHandle(name, { create: true });
+    await source.stream().pipeTo(await target.createWritable());
+    await staging.removeEntry(handle.name).catch(() => {});
+  }
 
   const api = {
     /**
-     * Pipe a ReadableStream to disk, optionally continuing a partial file.
+     * Consume a plaintext stream, store it, and return its content address.
      *
-     * `offset > 0` resumes: the file is opened with keepExistingData (the default
-     * truncates), the cursor is seeked past what is already there, and the new
-     * bytes are appended. That is what makes a transfer that died at 60% cost
-     * 40% to finish instead of 100%.
+     * The stream is read once by hand rather than tee()'d, because hashing and
+     * compressing both need every byte at the same rate and a tee whose branches
+     * are consumed at different rates queues the difference without bound. One
+     * reader, one megabyte held, and both consumers see each block in turn.
      *
-     * Compression and resumability are mutually exclusive, so the caller says
-     * up front which it wants and is told which it got.
+     * Bytes reach disk a whole block at a time and never in part. That is what
+     * `resume` needs from a failed attempt: a file whose length is a block
+     * boundary, and — because a block is a multiple of 64 — a SHA-256 state that
+     * can be picked up exactly where it stopped. `progress` is filled in as
+     * blocks land, and is what a later call passes back as `resume`.
      */
-    async put(key, stream, mime = "", { offset = 0, resumable = false } = {}) {
-      const resuming = offset > 0;
-      // gzip is stateful: bytes appended to a stream whose compressor state is
-      // gone do not decode. So anything that might have to resume is stored raw,
-      // decided up front — not only once a resume is actually attempted.
-      const encoding =
-        !resuming && !resumable && COMPRESSIBLE.test(mime) && "CompressionStream" in globalThis
-          ? "gzip"
+    async put(key, stream, mime = "", { resume: from = null, progress = null, expect = null } = {}) {
+      // Progress with no complete block is not a resume point — it is a start.
+      // Honouring it anyway would adopt its encoding, and an empty record's
+      // encoding is null, which would store a compressible payload raw.
+      const resume = from?.blocks?.length ? from : null;
+
+      // A resumed write must use whatever the first attempt chose; a file cannot
+      // be half raw and half compressed.
+      const encoding = resume
+        ? (resume.encoding ?? null)
+        : COMPRESSIBLE.test(mime) && "CompressionStream" in globalThis
+          ? ENCODING
           : null;
 
-      // Measure and checksum on the way past. Once compressed, the file size is
-      // the stored size rather than the payload's real length, and the real
-      // length is what a caller means by "how big is this".
-      let received = 0;
-      const hasher = hashingStream();
-      const measured = stream.pipeThrough(
-        new TransformStream({
-          transform(chunk, controller) {
-            received += chunk.byteLength ?? chunk.length ?? 0;
-            hasher.update(chunk);
-            controller.enqueue(chunk);
-          },
-        }),
-      );
-      const body = encoding ? measured.pipeThrough(new CompressionStream(encoding)) : measured;
+      const lengths = resume?.blocks ? [...resume.blocks] : [];
+      const resuming = lengths.length > 0;
+      // Only the final block is ever short, so complete blocks account for
+      // exactly their nominal plaintext regardless of what the file holds.
+      let plain = lengths.length * BLOCK_SIZE;
+      let written = lengths.reduce((n, v) => n + v, 0);
 
-      const file = await store.getFileHandle(key, { create: true });
-      const writable = await file.createWritable({ keepExistingData: resuming });
-      if (resuming) await writable.write({ type: "seek", position: offset });
+      // Checkpointing costs the software SHA-256 rather than crypto.subtle,
+      // which only whole-buffer digests can use. Callers that will never resume
+      // pass no progress object and keep the fast path.
+      const hasher = hashingStream({
+        resumable: Boolean(progress || resume),
+        from: resume?.hash ?? null,
+      });
 
-      // Nothing reaches disk until close(); a failed pipeTo leaves the previous
-      // contents intact, which is exactly what a resume needs.
-      await body.pipeTo(writable);
+      const handle = await staging.getFileHandle(key, { create: true });
+      const writable = await handle.createWritable({ keepExistingData: resuming });
+      const writer = writable.getWriter();
+      if (resuming) {
+        // A previous attempt may have landed a short final block past the last
+        // checkpoint. Cut back to the checkpoint before seeking to it, or those
+        // bytes survive underneath everything written from here on.
+        await writer.write({ type: "truncate", size: written });
+        await writer.write({ type: "seek", position: written });
+      }
 
-      const { hash, via } = await hasher.digest();
+      const emit = async (block) => {
+        hasher.update(block);
+        const member = encoding ? await gzipMember(block) : block;
+        await writer.write(member);
+
+        lengths.push(member.byteLength);
+        written += member.byteLength;
+        plain += block.byteLength;
+
+        // Only a full block leaves the hash on a 64-byte boundary, and only a
+        // full block can be followed by more — so a short one is never a resume
+        // point and never needs to be one.
+        if (!progress || block.byteLength !== BLOCK_SIZE) return;
+        const hash = hasher.snapshot();
+        // `plain` is what a resume asks the server for; `offset` is where on
+        // disk to continue. Compression makes those two different numbers, and
+        // the caller should not have to know the block size to derive either.
+        if (hash) {
+          Object.assign(progress, { plain, offset: written, blocks: [...lengths], hash, encoding });
+        }
+      };
+
+      const reader = stream.getReader();
+      const pending = new Uint8Array(BLOCK_SIZE);
+      let held = 0;
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          let chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+          while (chunk.length) {
+            const take = Math.min(BLOCK_SIZE - held, chunk.length);
+            pending.set(chunk.subarray(0, take), held);
+            held += take;
+            chunk = chunk.subarray(take);
+            if (held < BLOCK_SIZE) continue;
+            // Copied out: the sink may hold the buffer past write(), and the
+            // next block reuses it.
+            await emit(pending.slice(0, BLOCK_SIZE));
+            held = 0;
+          }
+        }
+        if (held) await emit(pending.slice(0, held));
+        if (encoding) await writer.write(encodeTrailer(lengths, BLOCK_SIZE, held || BLOCK_SIZE));
+        await writer.close();
+      } catch (err) {
+        // Nothing lands until close(), so aborting here would throw away every
+        // complete block along with the broken one. Closing keeps them, which is
+        // the whole resume story — a transfer that died at 60% costs 40% to
+        // finish rather than 100%.
+        await writer.close().catch(() => {});
+        reader.cancel().catch(() => {});
+        // With no progress object there is no resume path, so a prefix is only
+        // garbage, and leaving it would mean a failed write grew the store.
+        if (!progress) await staging.removeEntry(key).catch(() => {});
+        throw err;
+      }
+
+      const { hash } = await hasher.digest();
+
+      // The announced length is the only independent statement of what the bytes
+      // should be. Checking it here rather than after promotion is what keeps a
+      // truncated transfer from being content-addressed as though it were whole.
+      if (expect !== null && expect !== undefined && plain !== expect) {
+        throw new Error(`payload ${key}: expected ${expect} bytes, stored ${plain}`);
+      }
+
+      // Same content already at rest — under either encoding, since the address
+      // is over the plaintext. Adopt what is there and drop what we just wrote;
+      // the caller records the encoding it got rather than the one it chose.
+      const existing = await api.resolve(hash);
+      if (existing) {
+        await staging.removeEntry(key).catch(() => {});
+        return {
+          sha256: hash,
+          size: existing.size,
+          stored: existing.file.size,
+          encoding: existing.encoding,
+          deduped: true,
+        };
+      }
+
+      const name = encoding ? hash + SUFFIX : hash;
+      await promote(handle, name);
       return {
-        size: offset + received,
-        stored: (await file.getFile()).size,
+        sha256: hash,
+        size: plain,
+        stored: (await (await objects.getFileHandle(name)).getFile()).size,
         encoding,
-        // A resume hashes only what it appended, so the digest describes the
-        // whole payload only when the write started at zero.
-        sha256: resuming ? null : hash,
-        hashedVia: via,
+        deduped: false,
       };
     },
 
     /**
-     * A ReadableStream of the original bytes, decompressed if needed.
+     * Locate an object by content address.
      *
-     * Returns a stream rather than a File because a gzip'd file has to be piped
-     * to be read, and callers should not care which case they got.
+     * Both encodings are probed because dedupe is over plaintext: the same bytes
+     * may already be at rest in whichever form the first arrival chose. A
+     * container whose trailer will not parse is treated as absent — it is a
+     * write that never finished, and the log can announce the payload again.
      */
-    async get(key, { encoding = null } = {}) {
-      let file;
-      try {
-        file = await (await store.getFileHandle(key)).getFile();
-      } catch {
-        return null; // NotFoundError
+    async resolve(hash) {
+      if (!hash) return null;
+
+      for (const [name, encoding] of [
+        [hash + SUFFIX, ENCODING],
+        [hash, null],
+      ]) {
+        const handle = await fileHandle(objects, name);
+        if (!handle) continue;
+
+        const file = await handle.getFile();
+        const index = encoding ? await readTrailer(file) : null;
+        if (encoding && !index) continue;
+
+        /**
+         * Plaintext bytes [start, end], inclusive.
+         *
+         * Compressed payloads are seekable: a range decodes the blocks covering
+         * it and no others, so a <video> element seeks in one block's worth of
+         * work rather than a decode from zero. Range serving used to be offered
+         * only for uncompressed files, which is most of why anything large had
+         * to stay uncompressed.
+         */
+        const read = (start, end) =>
+          index
+            ? readBlocks(file, index, start, end)
+            : file.slice(start, end + 1).stream();
+
+        return { file, encoding, index, size: index ? index.size : file.size, read };
       }
-      const stream = file.stream();
-      return encoding === "gzip" ? stream.pipeThrough(new DecompressionStream("gzip")) : stream;
+      return null;
+    },
+
+    /** The whole payload as plaintext, whatever it is stored as. */
+    async get(hash) {
+      const found = await api.resolve(hash);
+      return found ? found.read(0, found.size - 1) : null;
+    },
+
+    /** Abandon a partial transfer. */
+    async discard(key) {
+      await staging.removeEntry(key).catch(() => {});
+    },
+
+    /** One address, either encoding. Only one can exist, but neither is known. */
+    async delete(hash) {
+      await Promise.all([
+        objects.removeEntry(hash + SUFFIX).catch(() => {}),
+        objects.removeEntry(hash).catch(() => {}),
+      ]);
     },
 
     /**
-     * The File itself, for callers that need to slice it.
+     * Address and size for every object.
      *
-     * Only meaningful for uncompressed payloads: a byte range of a gzip'd file
-     * is not a byte range of its contents, so range serving is restricted to
-     * those — which, by the resumable rule, are exactly the large ones.
-     */
-    async file(key) {
-      try {
-        return await (await store.getFileHandle(key)).getFile();
-      } catch {
-        return null;
-      }
-    },
-
-    /** Cut a partial file back to a known-good length. */
-    async truncate(key, size) {
-      const file = await store.getFileHandle(key, { create: true });
-      const writable = await file.createWritable({ keepExistingData: true });
-      await writable.write({ type: "truncate", size });
-      await writable.close();
-    },
-
-    /** Bytes already on disk for this key. The resume point. */
-    async sizeOf(key) {
-      try {
-        return (await (await store.getFileHandle(key)).getFile()).size;
-      } catch {
-        return 0;
-      }
-    },
-
-    async delete(key) {
-      await store.removeEntry(key).catch(() => {});
-    },
-
-    /**
-     * Name and size for everything stored, in one pass.
-     *
-     * entries() yields [name, handle] pairs, so this costs one directory
-     * iteration — keys() would mean a second getFileHandle() per file.
+     * entries() yields [name, handle] pairs, so the directory is walked once —
+     * keys() would mean a second getFileHandle() per file. The walk is serial
+     * because the iterator is, but the getFile() calls it feeds are not: awaited
+     * in the loop they would serialise a round trip per object, and this runs on
+     * every maintenance pass over every payload we hold.
      */
     async list() {
-      const out = [];
-      for await (const [name, handle] of store.entries()) {
+      const pending = [];
+      for await (const [name, handle] of objects.entries()) {
         if (handle.kind !== "file") continue;
-        out.push({ key: name, stored: (await handle.getFile()).size });
+        const hash = name.endsWith(SUFFIX) ? name.slice(0, -SUFFIX.length) : name;
+        pending.push(handle.getFile().then((file) => ({ hash, stored: file.size })));
       }
-      return out;
+      return Promise.all(pending);
     },
 
-    /** Drop payloads the log no longer references. Called after the log trims. */
-    async sweep(live) {
-      const keep = new Set(live);
+    /**
+     * Drop what the log no longer references. Called after the log trims.
+     *
+     * Objects are refcounted by reachability rather than a counter: an address
+     * survives while any live event still names it, so the last key referring to
+     * a shared payload is what releases it, and a counter that could drift out
+     * of step with the log never exists.
+     *
+     * Staging is swept by key on the same principle. A partial transfer whose
+     * announcement has been trimmed away can never be resumed, because nothing
+     * is left to say what the rest of it is.
+     */
+    async sweep(liveHashes, liveKeys = []) {
+      const keepHashes = new Set(liveHashes);
+      const keepKeys = new Set(liveKeys);
       let removed = 0;
-      for (const { key } of await api.list()) {
-        if (keep.has(key)) continue;
-        await api.delete(key);
+
+      for (const { hash } of await api.list()) {
+        if (keepHashes.has(hash)) continue;
+        await api.delete(hash);
+        removed += 1;
+      }
+      for await (const name of staging.keys()) {
+        if (keepKeys.has(name)) continue;
+        await staging.removeEntry(name).catch(() => {});
         removed += 1;
       }
       return removed;
@@ -198,19 +370,27 @@ export async function openBlobStore() {
      * is the other half: hold total bytes under a budget, and drop from the
      * front of the log's own order rather than by size, so eviction stays
      * predictable instead of preferring whatever happens to be biggest.
+     *
+     * `oldestFirst` is ordered by each object's *newest* reference, which is not
+     * the same as its oldest once payloads are shared. An object first seen long
+     * ago and announced again this minute is live data wearing an old timestamp,
+     * and evicting it would break the recent key as well as the ancient one.
      */
     async evictTo(budget, oldestFirst) {
-      const files = new Map((await api.list()).map((f) => [f.key, f.stored]));
-      let total = [...files.values()].reduce((n, v) => n + v, 0);
+      const sizes = new Map();
+      for (const { hash, stored } of await api.list()) {
+        sizes.set(hash, (sizes.get(hash) ?? 0) + stored);
+      }
+      let total = [...sizes.values()].reduce((n, v) => n + v, 0);
       const evicted = [];
 
-      for (const key of oldestFirst) {
+      for (const hash of oldestFirst) {
         if (total <= budget) break;
-        const size = files.get(key);
+        const size = sizes.get(hash);
         if (size === undefined) continue;
-        await api.delete(key);
+        await api.delete(hash);
         total -= size;
-        evicted.push(key);
+        evicted.push(hash);
       }
       return { evicted, total };
     },
@@ -220,20 +400,22 @@ export async function openBlobStore() {
      *
      * FileSystemHandle.remove({recursive:true}) does it in one call, but it is
      * experimental and non-standard, so it is a fast path with the portable
-     * per-entry loop behind it. Removing the directory invalidates our handle,
+     * per-entry loop behind it. Removing a directory invalidates our handle,
      * hence the re-acquire.
      */
     async clear() {
-      if (typeof store.remove === "function") {
+      for (const name of [OBJECTS, STAGING]) {
         try {
-          await store.remove({ recursive: true });
-          store = await openDir();
-          return;
+          await root.removeEntry(name, { recursive: true });
         } catch {
-          // fall through to the portable path
+          const dir = await root.getDirectoryHandle(name, { create: true });
+          for await (const entry of dir.keys()) {
+            await dir.removeEntry(entry, { recursive: true }).catch(() => {});
+          }
         }
       }
-      for await (const name of store.keys()) await store.removeEntry(name, { recursive: true });
+      objects = await root.getDirectoryHandle(OBJECTS, { create: true });
+      staging = await root.getDirectoryHandle(STAGING, { create: true });
     },
   };
 

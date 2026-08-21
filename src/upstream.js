@@ -27,8 +27,13 @@ const CURSOR_FLUSH_MS = 1000;
 const LARGE_PAYLOAD = 8 * 1024 * 1024;
 
 /**
- * Above this, a payload is stored uncompressed so a failed transfer can resume
- * from its prefix. Below it, restarting is cheaper than giving up gzip.
+ * Above this, a failed transfer resumes from its prefix instead of starting
+ * over. Below it a restart costs less than the round trip to negotiate one.
+ *
+ * This used to also decide compression, because a gzip stream could not be
+ * appended to and so anything worth resuming had to be stored raw. Block-wise
+ * gzip removed that trade — see blocks.js — leaving this as what it reads like:
+ * a threshold on whether resuming is worth the effort.
  */
 const RESUMABLE_ABOVE = 1024 * 1024;
 
@@ -152,22 +157,33 @@ async function receiveBlobExclusive(key, frame, { log, blobs, registration, sign
     }
   }
 
-  // An upstream may re-announce a payload it has already delivered. Holding the
-  // full announced length means there is nothing to fetch.
-  if (frame.size && (await blobs.sizeOf(key)) >= frame.size && !(await log.getMeta(key))?.partial) {
+  const known = await log.getMeta(key);
+
+  // An upstream may re-announce a payload it has already delivered. The object
+  // resolving under its recorded address means the bytes are here — and because
+  // objects are content-addressed, that stays true when some other key was what
+  // actually brought them in.
+  if (known?.sha256 && (await blobs.resolve(known.sha256))) {
     frame.body?.cancel().catch(() => {});
     return;
   }
 
   const resumable = (frame.size ?? 0) >= RESUMABLE_ABOVE;
 
+  // Progress from an attempt that died: complete blocks on disk, and the
+  // SHA-256 state as of the last one. Without the hash state a resumed transfer
+  // could not be content-addressed at all, because the bytes it never saw are
+  // the ones it would need to hash.
+  const resume = resumable ? (known?.resume ?? null) : null;
+  const progress = resumable ? {} : null;
+
   // WebTransport hands us the bytes; SSE hands us a reference to go get them.
   // Only the reference case can resume — a stream that already died is gone.
   let body = frame.body;
-  let offset = 0;
+  let from = resume;
 
   if (!body) {
-    const have = resumable ? await blobs.sizeOf(key) : 0;
+    const have = resume?.plain ?? 0;
     const res = await fetch(frame.href, {
       signal,
       headers: have > 0 ? { range: `bytes=${have}-` } : {},
@@ -176,43 +192,36 @@ async function receiveBlobExclusive(key, frame, { log, blobs, registration, sign
     // 206 means the server honoured the range and is sending the remainder. A
     // plain 200 means it ignored it and is resending everything, so start over
     // rather than append a second copy onto the prefix we already hold.
-    offset = res.status === 206 ? have : 0;
+    if (res.status !== 206) from = null;
     body = res.body;
+  } else if (resume) {
+    // Pushed bytes always start at zero; there is no way to ask for less.
+    from = null;
   }
 
   // Bytes land first, the log entry commits second. There is no transaction
   // across OPFS and IndexedDB, so the log is the authority: an orphaned file is
   // recoverable garbage, a logged event with no bytes is a broken promise.
+  //
+  // `expect` moves the length check inside the write, so a short transfer is
+  // never content-addressed as though it were whole.
   let result;
   try {
-    result = await blobs.put(key, body, mime, { offset, resumable });
+    result = await blobs.put(key, body, mime, { resume: from, progress, expect: frame.size });
   } catch (err) {
-    if (!resumable) {
-      await blobs.delete(key); // no resume path, so a prefix is only garbage
+    if (!resumable || !progress?.blocks?.length) {
+      // No resume path, so a prefix is only garbage.
+      await blobs.discard(key);
       throw err;
     }
-    // Keep the prefix and record how far it got. The next announcement of this
-    // key picks up from there instead of starting at zero.
-    await log.putMeta(key, { name, mime, size: frame.size, partial: await blobs.sizeOf(key) });
+    // Keep the prefix and record how far it got, so the next announcement of
+    // this key picks up from there instead of starting at zero.
+    await log.putMeta(key, { name, mime, size: frame.size, partial: progress.plain, resume: progress });
     await log.append({
       type: "blob-partial",
-      data: { key, name, have: await blobs.sizeOf(key), of: frame.size ?? null },
+      data: { key, name, have: progress.plain, of: frame.size ?? null },
     });
     throw err;
-  }
-
-  // A transfer that ended early, or a resume that appended at the wrong offset,
-  // both produce a file of the wrong length. Announced size is the only
-  // independent statement of what the bytes should be, so it is checked rather
-  // than trusted, and a mismatch keeps the prefix for another attempt instead of
-  // logging a payload that is quietly wrong.
-  if (frame.size && result.size !== frame.size) {
-    await log.putMeta(key, { name, mime, size: frame.size, partial: await blobs.sizeOf(key) });
-    await log.append({
-      type: "blob-partial",
-      data: { key, name, have: result.size, of: frame.size },
-    });
-    throw new Error(`payload ${key}: expected ${frame.size} bytes, stored ${result.size}`);
   }
 
   const meta = {

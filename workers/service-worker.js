@@ -42,7 +42,7 @@ const OUTBOX_TAG = "outbox";
  * fails before any of this runs. Bump VERSION to invalidate; entries are
  * served cache-first, so an edit is otherwise invisible to a controlled page.
  */
-const VERSION = "shell-v13";
+const VERSION = "shell-v14";
 const SHELL = [
   "./",
   "./index.html",
@@ -55,6 +55,7 @@ const SHELL = [
   "./src/sse.js",
   "./src/log.js",
   "./src/blobs.js",
+  "./src/blocks.js",
   "./src/transport.js",
   "./src/upstream.js",
   "./src/sha256.js",
@@ -122,11 +123,13 @@ function boot() {
 
     const pass = async () => {
       await log.trim();
-      const live = await log.liveKeys();
-      await blobs.sweep(live);
+      // Keys name transfers, hashes name objects, and one object can back
+      // several keys — so what is reachable has to be gathered as both.
+      const { keys, hashes } = await log.liveObjects();
+      await blobs.sweep(hashes, keys);
       // Count-based retention says nothing about size, so the byte budget runs
       // every pass rather than only when the log happened to be trimmed.
-      await blobs.evictTo(PAYLOAD_BUDGET, live);
+      await blobs.evictTo(PAYLOAD_BUDGET, hashes);
     };
 
     /**
@@ -281,7 +284,7 @@ async function transferBlob(key, client) {
   if (!client) return;
   const { log, blobs } = await boot();
   const meta = (await log.getMeta(key)) ?? {};
-  const stream = await blobs.get(key, { encoding: meta.encoding });
+  const stream = await blobs.get(meta.sha256);
 
   if (!stream) {
     client.postMessage({ type: "pull-miss", key, pending: Boolean(meta.pending) });
@@ -376,8 +379,10 @@ async function collectBackgroundFetch(bgFetch) {
   }
 
   const mime = meta.mime || response.headers.get("content-type") || "application/octet-stream";
-  const { size, stored, encoding } = await blobs.put(key, response.body, mime);
-  const settled = { name: meta.name ?? key, mime, size: meta.size ?? size, stored, encoding };
+  // The announced size was a promise about a download that had not happened
+  // yet; what arrived is what the address is over, so what arrived is recorded.
+  const { size, stored, encoding, sha256 } = await blobs.put(key, response.body, mime);
+  const settled = { name: meta.name ?? key, mime, size, stored, encoding, sha256 };
 
   await log.putMeta(key, settled);
   await log.append({ type: "blob", data: { key, ...settled } });

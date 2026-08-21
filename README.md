@@ -18,7 +18,7 @@ Live: <https://damionrashford.github.io/durable-stream/>
 │  shell      Cache Storage — the app loads with no net  │
 │  router     URLPattern → route, HEAD, 405            │
 │  log        IndexedDB, append-only, monotonic ids    │
-│  blobs      OPFS, streamed, gzip'd, resumable        │
+│  blobs      OPFS, content-addressed, block-gzip'd    │
 │  upstream   dials out; WebTransport, WS(Stream), SSE  │
 │  deferred   sync + backgroundfetch                   │
 └──────────────────────────────────────────────────────┘
@@ -77,10 +77,20 @@ as real once its `blob` event commits.
 | Data | Store | Why |
 |---|---|---|
 | Event log | IndexedDB | the autoIncrement key *is* the cursor; range queries; reachable from the worker |
-| Payloads | OPFS | `createWritable()` is a `WritableStream`, so uploads `pipeTo` disk and never buffer |
-| Integrity | streaming SHA-256 | standard digest, so an upstream can verify it with any tool |
+| Payloads | OPFS | `createWritable()` is a `WritableStream`, so uploads reach disk without buffering |
+| Identity | streaming SHA-256 | standard digest, so an upstream can verify it with any tool — and the address a payload is stored under |
 | Read model | SQLite wasm | derived, disposable, rebuilt from the log |
 | App shell | Cache Storage | so there is something to read the log *with* offline |
+
+Payloads are stored by content hash, so the same bytes announced under three keys cost
+one copy. Keys map to addresses in the log; objects are refcounted by reachability
+rather than a counter, so the last live key referring to a payload is what releases it.
+
+Anything compressible is stored as a sequence of independently decodable 1 MiB gzip
+members with their boundaries recorded, which is what lets a compressed payload both
+resume from its prefix and serve a byte range — see `src/blocks.js`. A block boundary is
+also a SHA-256 block boundary, so a transfer that dies can carry its digest state
+forward and still arrive at the standard hash of the whole payload.
 
 Retention trims the log to 5000 events, sweeps payloads no surviving event references,
 and evicts oldest-first to hold payloads under a byte budget — a count says nothing
@@ -102,7 +112,8 @@ src/
   router.js                URLPattern, HEAD dispatch, 405 + Allow
   sse.js                   framing and parsing as TransformStreams
   log.js                   IndexedDB log, retention, outbox, BroadcastChannel
-  blobs.js                 OPFS store: compression, ranges, resumable writes
+  blobs.js                 OPFS store: content addressing, dedupe, resumable writes
+  blocks.js                block-wise gzip container: resumable *and* seekable
   transport.js             upstream: WebTransport with SSE fallback
   upstream.js              frame routing, cursor, Background Fetch
   render.js                by MIME: streaming text, ranged media, download

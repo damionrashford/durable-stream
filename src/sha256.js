@@ -25,14 +25,20 @@ const K = new Uint32Array([
 
 const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
 
-export function sha256Stream() {
-  const state = Int32Array.from([
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-  ]);
+const IV = [
+  0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+/**
+ * @param {{state: number[], length: number}|null} from
+ *   A snapshot to continue from, as returned by `snapshot()`.
+ */
+export function sha256Stream(from = null) {
+  const state = Int32Array.from(from?.state ?? IV);
   const buffer = new Uint8Array(64);
   const words = new Uint32Array(64);
   let buffered = 0;
-  let length = 0; // total bytes, for the length suffix
+  let length = from?.length ?? 0; // total bytes, for the length suffix
 
   const compress = (block, at) => {
     for (let i = 0; i < 16; i += 1) {
@@ -108,6 +114,19 @@ export function sha256Stream() {
       return out;
     },
 
+    /**
+     * Everything needed to continue this hash later, or null if we are mid-block.
+     *
+     * Merkle-Damgard holds all it knows in the 256-bit state plus a byte count,
+     * so a hash in progress serialises to nine numbers — but only between
+     * blocks. Mid-block there is an unabsorbed remainder as well, and rather
+     * than serialise that too this refuses, because a caller that checkpoints on
+     * a 64-byte boundary never sees the case. A 1 MiB block is 16384 of them.
+     */
+    snapshot() {
+      return buffered ? null : { state: [...state], length };
+    },
+
     get bytes() {
       return length;
     },
@@ -126,11 +145,16 @@ const NATIVE_LIMIT = 8 * 1024 * 1024;
  * limit; below it the whole payload goes to the native digest, and above it the
  * held chunks are replayed into the streaming implementation and memory returns
  * to constant. Either path produces the same standard digest.
+ *
+ * `resumable` gives that choice up and streams from the first byte. A digest
+ * that has to survive a dropped connection needs `snapshot()`, and crypto.subtle
+ * exposes no state at all — it only takes whole buffers and returns whole
+ * digests, so the fast path is a dead end for anything that might be continued.
  */
-export function hashingStream() {
+export function hashingStream({ resumable = false, from = null } = {}) {
   let held = [];
   let size = 0;
-  let streaming = null;
+  let streaming = resumable || from ? sha256Stream(from) : null;
 
   return {
     update(chunk) {
@@ -145,6 +169,11 @@ export function hashingStream() {
       streaming = sha256Stream();
       for (const part of held) streaming.update(part);
       held = [];
+    },
+
+    /** Null unless this hash was opened resumable; see sha256Stream.snapshot. */
+    snapshot() {
+      return streaming?.snapshot() ?? null;
     },
 
     async digest() {

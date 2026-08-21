@@ -171,25 +171,25 @@ async function putBlob(request, { log, blobs, maintain, storageStatus }, { key }
   const { pressure } = await storageStatus();
   if (pressure > PRESSURE_LIMIT) await maintain?.(true);
 
-  let size;
-  let stored;
-  let encoding;
-  let sha256;
+  let written;
   try {
-    ({ size, stored, encoding, sha256 } = await blobs.put(key, request.body, mime));
+    written = await blobs.put(key, request.body, mime);
   } catch (err) {
     if (!isQuota(err)) throw err;
-    // blobs.put() removed the partial file, so the store is consistent. One
+    // blobs.put() removed the staged file, so the store is consistent. One
     // forced pass, then the caller is told for real.
     await maintain?.(true);
     return json({ error: "quota exceeded", key }, 507);
   }
 
+  const { size, stored, encoding, sha256, deduped } = written;
   const meta = { name, mime, size, stored, encoding, sha256 };
   await log.putMeta(key, meta);
   await log.append({ type: "blob", data: { key, ...meta } });
   maintain?.();
-  return json({ key, ...meta });
+  // `deduped` is not part of the payload's identity, so it stays out of the log
+  // and the metadata — it describes this write, not these bytes.
+  return json({ key, ...meta, deduped });
 }
 
 /**
@@ -224,23 +224,26 @@ function parseRange(header, size) {
 /**
  * Serve a payload, honouring conditional and range requests.
  *
- * Range support is what makes a media element seekable — without 206 a <video>
- * can only play a payload from the start. It is offered only for uncompressed
- * files: a byte range of gzip'd data is not a byte range of its contents, and
- * decompressing to slice would buffer the whole thing. By the resumable rule
- * the uncompressed ones are the large ones, which is where seeking matters.
+ * The key names a transfer; the object behind it is named by its content, so
+ * this is where the two meet. A key with no address, or an address with nothing
+ * at rest, is a 404 — the same case as a payload the log announced and the
+ * browser then evicted.
  *
- * The ETag is strong: keys are content-addressed and never rewritten, so key
- * plus stored length identifies the bytes exactly.
+ * Range support is what makes a media element seekable — without 206 a <video>
+ * can only play a payload from the start. It now applies to compressed payloads
+ * too: the object is a sequence of independently decodable blocks, so a range
+ * costs the blocks it covers instead of a decode from the beginning.
+ *
+ * The ETag is strong and is simply the content address. Two keys holding the
+ * same bytes share one validator, which is correct — they are the same entity.
  */
 async function getBlob(request, { log, blobs }, { key }) {
   const meta = (await log.getMeta(key)) ?? {};
-  const file = await blobs.file(key);
-  if (!file) return json({ error: meta.pending ? "still downloading" : "not found" }, 404);
+  const object = await blobs.resolve(meta.sha256);
+  if (!object) return json({ error: meta.pending ? "still downloading" : "not found" }, 404);
 
-  const compressed = meta.encoding === "gzip";
-  const etag = `"${key}-${file.size}"`;
-  const mime = meta.mime || "application/octet-stream";
+  const size = object.size;
+  const etag = `"${meta.sha256}"`;
 
   // Nothing has changed and the client already has it.
   if (request.headers.get("if-none-match") === etag) {
@@ -249,44 +252,42 @@ async function getBlob(request, { log, blobs }, { key }) {
 
   const base = {
     etag,
-    "content-type": mime,
+    "content-type": meta.mime || "application/octet-stream",
     // Content-addressed and never rewritten, but revalidation is free and keeps
     // a deleted key from being served from cache forever.
     "cache-control": "no-cache",
-    "accept-ranges": compressed ? "none" : "bytes",
+    "accept-ranges": "bytes",
   };
 
-  const range = compressed ? null : parseRange(request.headers.get("range"), file.size);
+  const range = parseRange(request.headers.get("range"), size);
   if (range) {
     const { start, end } = range;
-    // slice() is lazy — the bytes are not read until the body is consumed.
-    return new Response(file.slice(start, end + 1).stream(), {
+    // Lazy either way: a slice is not read, and a block is not decoded, until
+    // the body is consumed.
+    return new Response(object.read(start, end), {
       status: 206,
       headers: {
         ...base,
-        "content-range": `bytes ${start}-${end}/${file.size}`,
+        "content-range": `bytes ${start}-${end}/${size}`,
         "content-length": String(end - start + 1),
       },
     });
   }
 
-  if (request.headers.get("range") && !compressed) {
+  if (request.headers.get("range")) {
     // Syntactically present but unsatisfiable.
     return new Response(null, {
       status: 416,
-      headers: { ...base, "content-range": `bytes */${file.size}` },
+      headers: { ...base, "content-range": `bytes */${size}` },
     });
   }
 
-  const stream = compressed
-    ? file.stream().pipeThrough(new DecompressionStream("gzip"))
-    : file.stream();
-
-  const headers = { ...base };
-  // No content-length when compressed: the on-disk size is not the decoded size,
-  // and a wrong one is worse than none.
-  if (!compressed) headers["content-length"] = String(file.size);
-  return new Response(stream, { headers });
+  // The plaintext length is known for both encodings now — the block trailer
+  // records it — so a compressed payload no longer has to be served without a
+  // content-length.
+  return new Response(object.read(0, size - 1), {
+    headers: { ...base, "content-length": String(size) },
+  });
 }
 
 /**

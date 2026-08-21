@@ -143,23 +143,39 @@ export async function openLog() {
     },
 
     /**
-     * Payload keys the log still references, oldest first.
+     * What the log still references: payload keys, and the objects behind them.
      *
-     * Order matters as much as membership: anything absent is orphaned and can
-     * go, and when space is short the front of this list is what goes next.
+     * Order matters as much as membership. Anything absent is orphaned and can
+     * go, and when space is short the front of these lists is what goes next.
+     *
+     * Keys keep their first appearance, because a key names one transfer and
+     * that transfer's age is when it was announced. Objects take their *last*,
+     * because content addressing means several keys can share one — and an
+     * object announced again a minute ago is recent data no matter how long ago
+     * some other key first introduced it. Re-inserting into a Map after deleting
+     * moves the entry to the end, so one pass in log order produces exactly
+     * that: oldest last-reference first.
      */
-    async liveKeys() {
+    async liveObjects() {
       const keys = [];
       const seen = new Set();
+      const hashes = new Map();
+
       for await (const e of api.since(0)) {
+        if (e.type !== "blob" && e.type !== "blob-pending") continue;
+
         const key = e.data?.key;
-        if (!key || seen.has(key)) continue;
-        if (e.type === "blob" || e.type === "blob-pending") {
+        if (key && !seen.has(key)) {
           seen.add(key);
           keys.push(key);
         }
+
+        const hash = e.data?.sha256;
+        if (!hash) continue;
+        hashes.delete(hash);
+        hashes.set(hash, true);
       }
-      return keys;
+      return { keys, hashes: [...hashes.keys()] };
     },
 
     /**
