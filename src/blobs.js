@@ -1,14 +1,13 @@
 /*
  * Binary payload store, backed by the Origin Private File System.
  *
- * Why OPFS and not IndexedDB for bytes: createWritable() returns a
- * FileSystemWritableFileStream, which IS a WritableStream. An incoming body pipes
- * straight to disk with real backpressure and never lands in memory — even for a
- * file larger than RAM. Reading back, getFile() returns a File (a Blob), whose
- * .stream() is native and lazy, and which is transferable to a page.
+ * createWritable() returns a FileSystemWritableFileStream, which is a
+ * WritableStream, so an incoming body pipes straight to disk with backpressure
+ * and a file larger than memory costs nothing to receive. getFile() returns a
+ * File, whose .stream() is lazy and whose slices are transferable to a page.
  *
- * Not used here: createSyncAccessHandle(). It is [Exposed=DedicatedWorker] in the
- * spec, so it does not exist in a service worker. The async API is what we get.
+ * The API here is the async one. createSyncAccessHandle() is
+ * [Exposed=DedicatedWorker], so it is unreachable from a service worker.
  */
 
 const DIR = "blobs";
@@ -113,14 +112,6 @@ export async function openBlobStore() {
       }
     },
 
-    /** Cut a partial file back to a known-good length. */
-    async truncate(key, size) {
-      const file = await store.getFileHandle(key, { create: true });
-      const writable = await file.createWritable({ keepExistingData: true });
-      await writable.write({ type: "truncate", size });
-      await writable.close();
-    },
-
     async delete(key) {
       await store.removeEntry(key).catch(() => {});
     },
@@ -138,17 +129,6 @@ export async function openBlobStore() {
         out.push({ key: name, stored: (await handle.getFile()).size });
       }
       return out;
-    },
-
-    async keys() {
-      const out = [];
-      for await (const name of store.keys()) out.push(name);
-      return out;
-    },
-
-    /** Total bytes this store is responsible for. */
-    async usage() {
-      return (await api.list()).reduce((n, f) => n + f.stored, 0);
     },
 
     /** Drop payloads the log no longer references. Called after the log trims. */

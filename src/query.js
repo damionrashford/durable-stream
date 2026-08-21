@@ -8,7 +8,7 @@
 
 const WORKER_URL = new URL("../workers/query.js", import.meta.url);
 
-export function createQueryClient({ backfill, base }) {
+export function createQueryClient({ backfill }) {
   let worker = null;
   let seq = 0;
   let synced = null;
@@ -63,7 +63,5 @@ export function createQueryClient({ backfill, base }) {
       await sync();
       return call("status");
     },
-
-    base,
   };
 }

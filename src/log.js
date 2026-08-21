@@ -58,7 +58,7 @@ const request = (req) =>
  * `requested`, but was a plain DOMException before that, and IndexedDB nests the
  * real error under `inner`. All three shapes have to be recognised.
  */
-const isQuota = (err) =>
+export const isQuota = (err) =>
   (typeof QuotaExceededError !== "undefined" && err instanceof QuotaExceededError) ||
   err?.name === "QuotaExceededError" ||
   err?.inner?.name === "QuotaExceededError";
@@ -112,7 +112,6 @@ export async function openLog() {
       // Tabs whose stream is dead still learn the log moved.
       channel.postMessage({ type: "append", id });
 
-      if (id % 256 === 0) api.trim().catch(() => {});
       return id;
     },
 
@@ -143,6 +142,15 @@ export async function openLog() {
       return cursor ? cursor.value.id : 0;
     },
 
+    /** Payload keys the log still references. Anything else in OPFS is orphaned. */
+    async liveKeys() {
+      const keys = new Set();
+      for await (const e of api.since(0)) {
+        if (e.type === "blob" || e.type === "blob-pending") keys.add(e.data?.key);
+      }
+      return keys;
+    },
+
     /**
      * Drop the oldest events beyond a retention window.
      *
@@ -170,12 +178,6 @@ export async function openLog() {
     subscribe(fn) {
       subscribers.add(fn);
       return () => subscribers.delete(fn);
-    },
-
-    /** Announce to other contexts without going through the service worker. */
-    onRemote(fn) {
-      channel.addEventListener("message", (e) => fn(e.data));
-      return () => channel.close();
     },
 
     /**

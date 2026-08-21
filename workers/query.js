@@ -1,22 +1,16 @@
 /*
- * SQL read model over the log, in a dedicated worker.
+ * SQL read model over the log.
  *
- * A dedicated worker, not the service worker, because that is the only place
- * SQLite can reach OPFS: createSyncAccessHandle() is [Exposed=DedicatedWorker],
- * and a service worker cannot spawn a Worker (`Worker` is
- * window_and_worker_except_service). So the page owns this, not sw.js.
+ * Runs in a dedicated worker because that is the only context where SQLite can
+ * reach OPFS: createSyncAccessHandle() is [Exposed=DedicatedWorker]. A service
+ * worker cannot spawn one, so the page owns this worker.
  *
- * This is a DERIVED read model, never the source of truth. Two documented
- * constraints make that the only honest arrangement:
- *
- *   - The "opfs" VFS needs SharedArrayBuffer, which needs COOP/COEP response
- *     headers. A static host cannot send headers, so that VFS cannot load here.
- *   - The "opfs-sahpool" VFS works without those headers but, per SQLite's own
- *     docs, "does not support multi-tab concurrency" — and multi-tab is the
- *     whole point of the log.
- *
- * So persistence is attempted and memory is the fallback. Losing it costs
- * nothing: the log rebuilds it.
+ * The model is derived. The log in IndexedDB stays authoritative, and this is
+ * rebuilt from it, because the VFS options both constrain what SQLite can be
+ * here: "opfs" needs SharedArrayBuffer and therefore COOP/COEP headers, while
+ * "opfs-sahpool" needs no headers but does not support multi-tab concurrency.
+ * sahpool is used where available and an in-memory database otherwise; either
+ * way the log can rebuild it.
  */
 
 const CDN = "https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.53.0-build1/dist/index.mjs";

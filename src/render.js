@@ -6,13 +6,12 @@
  *
  *   text    rendered as it arrives, chunk by chunk. Nothing is ever fully held,
  *           so a log file bigger than RAM still displays.
- *   media   an <img>/<video>/<audio> needs a URL, and a URL needs a Blob, so the
- *           stream is collected first. Bounded by the file size — the one case
- *           where buffering is unavoidable without MSE.
+ *   media   the element loads the payload URL itself. Its request carries Range,
+ *           so playback can seek and only the played part is read.
  *   other   drained straight to a download link; never decoded, never inspected.
  *
- * Every path takes the transferred ReadableStream, so the bytes are never text on
- * the wire regardless of how they end up on screen.
+ * Text and downloads consume the transferred stream. Media discards it and loads
+ * the URL instead, because only an HTTP request can carry Range.
  */
 
 const isText = (mime) =>
@@ -21,13 +20,20 @@ const isText = (mime) =>
 const MEDIA = { "image/": "img", "video/": "video", "audio/": "audio" };
 const mediaTag = (mime) => Object.entries(MEDIA).find(([p]) => mime.startsWith(p))?.[1];
 
-export async function render(into, { stream, mime = "application/octet-stream", name, size }) {
+export async function render(into, { stream, src, mime = "application/octet-stream", name, size }) {
   into.replaceChildren();
 
   if (isText(mime)) return renderText(into, stream);
 
   const tag = mediaTag(mime);
-  if (tag) return renderMedia(into, stream, tag, name);
+  if (tag) {
+    // The element fetches for itself rather than consuming the transferred
+    // stream: that request carries Range, so the payload is seekable and only
+    // the played part is ever read. Consuming the stream would mean holding the
+    // whole file in memory to produce a URL.
+    stream.cancel().catch(() => {});
+    return renderMedia(into, src, tag, name);
+  }
 
   return renderDownload(into, stream, name, size);
 }
@@ -57,22 +63,14 @@ async function renderText(into, stream) {
   }
 }
 
-/** Buffered by necessity: a media element needs an addressable URL. */
-async function renderMedia(into, stream, tag, name) {
-  const blob = await new Response(stream).blob();
-  const url = URL.createObjectURL(blob);
-
+/** Streamed by the element itself, over a range-capable URL. */
+function renderMedia(into, src, tag, name) {
   const el = document.createElement(tag);
-  el.src = url;
+  el.src = src;
   if (tag === "img") el.alt = name ?? "";
   else el.controls = true;
   el.className = "payload";
   into.append(el);
-
-  // The object URL owns the blob until revoked; release once it's decoded.
-  el.addEventListener(tag === "img" ? "load" : "loadeddata", () => URL.revokeObjectURL(url), {
-    once: true,
-  });
 }
 
 async function renderDownload(into, stream, name, size) {

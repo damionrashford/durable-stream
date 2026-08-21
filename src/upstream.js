@@ -63,14 +63,13 @@ export function ensureUpstream(state, { url, log, blobs, headers = {}, registrat
         const link = await openUpstream(url, { headers, cursor, signal: state.abort.signal });
 
         backoff = 1000;
-        state.transport = link.kind;
         await log.append({ type: "upstream", data: { state: "connected", via: link.kind, url } });
 
         for await (const frame of link.frames()) {
           if (!state.running) break;
 
           if (frame.kind === "blob") {
-            await receiveBlob(frame, { log, blobs, registration, url, signal: state.abort.signal });
+            await receiveBlob(frame, { log, blobs, registration, signal: state.abort.signal });
           } else {
             await log.append({ type: frame.type, data: frame.data });
           }
@@ -98,14 +97,6 @@ export function ensureUpstream(state, { url, log, blobs, headers = {}, registrat
 }
 
 /**
- * Store an incoming payload.
- *
- * Big ones are handed to Background Fetch instead of being streamed inline: it
- * keeps downloading after the tab closes and after this worker is killed, shows
- * OS-level progress, and wakes us with `backgroundfetchsuccess` when it lands.
- * An inline stream dies with the worker.
- */
-/**
  * Keys currently being written.
  *
  * createWritable() commits to a temp file and only lands on close(), so a second
@@ -128,6 +119,14 @@ async function receiveBlob(frame, ctx) {
   }
 }
 
+/**
+ * Store an incoming payload.
+ *
+ * Big ones are handed to Background Fetch instead of being streamed inline: it
+ * keeps downloading after the tab closes and after this worker is killed, shows
+ * OS-level progress, and wakes us with `backgroundfetchsuccess` when it lands.
+ * An inline stream dies with the worker.
+ */
 async function receiveBlobExclusive(key, frame, { log, blobs, registration, signal }) {
   const mime = frame.mime || "application/octet-stream";
   const name = frame.name ?? key;
@@ -146,7 +145,13 @@ async function receiveBlobExclusive(key, frame, { log, blobs, registration, sign
     }
   }
 
-  // Below this, restarting a failed transfer is cheaper than giving up gzip.
+  // An upstream may re-announce a payload it has already delivered. Holding the
+  // full announced length means there is nothing to fetch.
+  if (frame.size && (await blobs.sizeOf(key)) >= frame.size && !(await log.getMeta(key))?.partial) {
+    frame.body?.cancel().catch(() => {});
+    return;
+  }
+
   const resumable = (frame.size ?? 0) >= RESUMABLE_ABOVE;
 
   // WebTransport hands us the bytes; SSE hands us a reference to go get them.
@@ -192,9 +197,4 @@ async function receiveBlobExclusive(key, frame, { log, blobs, registration, sign
   const meta = { name, mime, size: frame.size ?? result.size, stored: result.stored, encoding: result.encoding };
   await log.putMeta(key, meta);
   await log.append({ type: "blob", data: { key, ...meta } });
-}
-
-export function stopUpstream(state) {
-  state.running = false;
-  state.abort?.abort();
 }

@@ -12,11 +12,10 @@
  * only exists in a service worker. Bytes never become text, so no base64, no
  * chunk alignment, no reassembly.
  *
- * Three events besides fetch, all of which exist because this worker is not a
- * daemon and gets killed when idle:
- *   sync                   flush the outbox once there is a network again
- *   backgroundfetchsuccess collect a payload the browser downloaded for us
- *   message                serve the data plane
+ * Events handled besides fetch:
+ *   message                data plane — transfers a payload stream to a client
+ *   sync                   flushes the outbox once the network returns
+ *   backgroundfetchsuccess collects a payload downloaded outside this worker
  */
 
 import { createHandler } from "../src/handler.js";
@@ -25,17 +24,20 @@ import { openBlobStore, storageStatus } from "../src/blobs.js";
 import { ensureUpstream } from "../src/upstream.js";
 
 /*
- * A real server to pull from. Empty means local-only.
+ * Origin to pull events from. Empty means local-only.
  *
- * The page's /api/events is not this: it is resolved by this worker and is
- * unreachable from the network. A server cannot push into it. This is the
- * direction that works — the worker dials out and holds the socket, and whatever
- * arrives is appended to the log that every tab already reads.
+ * This is outbound. The page's /api/events is resolved by this worker and is
+ * unreachable from the network, so a server reaches the app by being connected
+ * to, not by connecting. Frames that arrive are appended to the log every tab
+ * reads, so one socket serves every tab.
  */
 const UPSTREAM = "";
 const UPSTREAM_HEADERS = {};
 
 const OUTBOX_TAG = "outbox";
+
+/** Minimum gap between retention passes. */
+const MAINTENANCE_MS = 30_000;
 
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
@@ -58,6 +60,28 @@ function boot() {
       headers: UPSTREAM_HEADERS,
       registration: self.registration,
     });
+    /*
+     * Retention has two halves. Trimming the log drops old events; sweeping
+     * drops the payloads those events were the only reference to. Without the
+     * second half OPFS grows without bound no matter what the log does.
+     *
+     * Throttled rather than run per write: sweeping walks the whole log and the
+     * whole directory, and neither changes meaningfully between two appends.
+     */
+    let lastMaintenance = 0;
+    let maintaining = null;
+    const maintain = () => {
+      if (maintaining || Date.now() - lastMaintenance < MAINTENANCE_MS) return;
+      maintaining = (async () => {
+        try {
+          if (await log.trim()) await blobs.sweep(await log.liveKeys());
+        } finally {
+          lastMaintenance = Date.now();
+          maintaining = null;
+        }
+      })();
+    };
+
     return {
       log,
       blobs,
@@ -68,6 +92,7 @@ function boot() {
         upstream: UPSTREAM,
         registration: self.registration,
         outboxTag: OUTBOX_TAG,
+        maintain,
       }),
     };
   })();
@@ -79,29 +104,18 @@ function boot() {
 const apiPrefix = () => new URL("api/", self.registration.scope).pathname;
 
 /*
- * Cross-origin isolation, synthesized. Off by default — read why before enabling.
+ * Enables cross-origin isolation by re-wrapping the document response with
+ * COOP/COEP, which grants SharedArrayBuffer and the SQLite "opfs" VFS.
  *
- * COOP/COEP are response headers on the top-level document, and a static host
- * sends none, which is why SharedArrayBuffer, the SQLite "opfs" VFS, and JS
- * self-profiling all looked permanently out of reach here.
+ * A navigation from a controlled page passes through this handler, so the
+ * headers can be added even where the host sends none. The first load is never
+ * isolated: nothing controls it yet, so isolation starts on the load after
+ * registration.
  *
- * They are not. A controlled page's navigation request passes through this
- * handler, so the document response can be re-wrapped before the browser sees
- * it. Measured with this flag on: crossOriginIsolated === true and
- * SharedArrayBuffer is available on GitHub Pages. The first load is never
- * isolated — nothing is controlling it yet — so it begins on the next one.
- *
- * What it costs, also measured:
- *   - Under require-corp every cross-origin subresource must carry CORP or be
- *     fetched with CORS. jsDelivr sends cross-origin-resource-policy, so the
- *     SQLite CDN assets survive.
- *   - The SQL read model's worker nonetheless fails to start when isolation is
- *     on. The CDN import and wasm init both succeed on the page, and an
- *     unrelated module worker runs fine, so it is specific to that worker and
- *     is not yet diagnosed.
- *
- * So this trades a working feature for a capability nothing here uses yet.
- * Turn it on when something needs SharedArrayBuffer, and fix the worker first.
+ * Two conditions apply when enabled. Under require-corp every cross-origin
+ * subresource must carry CORP or be fetched with CORS. And the SQL read model's
+ * worker does not start under isolation, so query.js is unavailable while this
+ * is on.
  */
 const ISOLATE = false;
 

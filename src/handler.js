@@ -14,6 +14,7 @@
  */
 
 import { createRouter } from "./router.js";
+import { isQuota } from "./log.js";
 import { encodeSSE, SSE_HEADERS } from "./sse.js";
 
 const json = (body, status = 200) =>
@@ -75,7 +76,11 @@ function streamEvents(request, { log }) {
             if (!lagging) {
               lagging = true;
               try {
-                controller.enqueue({ data: JSON.stringify({ type: "lagged", data: { from: last } }) });
+                // A named event, and deliberately without an id: it is a signal
+                // about the stream, not an entry in the log. An unnamed frame
+                // would arrive carrying the previous id, and a client indexing
+                // by id would overwrite a real event with it.
+                controller.enqueue({ event: "lagged", data: JSON.stringify({ from: last }) });
               } catch {
                 unsubscribe?.();
               }
@@ -124,7 +129,7 @@ function streamEvents(request, { log }) {
  * the operation stays queued and the next flush picks it up.
  */
 async function appendEvent(request, ctx) {
-  const { log, upstream, registration, outboxTag } = ctx;
+  const { log, upstream, registration, outboxTag, maintain } = ctx;
   const body = await request.json().catch(() => null);
   if (!body?.type) return json({ error: "type required" }, 400);
 
@@ -142,6 +147,7 @@ async function appendEvent(request, ctx) {
     await registration?.sync?.register(outboxTag).catch(() => {});
   }
 
+  maintain?.();
   return json({ id, queued });
 }
 
@@ -152,7 +158,7 @@ async function appendEvent(request, ctx) {
  * OPFS and IndexedDB, so the log is the authority: an orphaned file is recoverable
  * garbage, but a logged event with no bytes is a broken promise.
  */
-async function putBlob(request, { log, blobs }, { key }) {
+async function putBlob(request, { log, blobs, maintain }, { key }) {
   const mime = request.headers.get("x-mime") || "application/octet-stream";
   const name = request.headers.get("x-name") ?? key;
 
@@ -164,15 +170,14 @@ async function putBlob(request, { log, blobs }, { key }) {
   } catch (err) {
     // Out of space. blobs.put() already removed the partial file, so the store
     // is consistent; the caller decides whether to trim and retry.
-    if (err?.name === "QuotaExceededError") {
-      return json({ error: "quota exceeded", key }, 507);
-    }
+    if (isQuota(err)) return json({ error: "quota exceeded", key }, 507);
     throw err;
   }
 
   const meta = { name, mime, size, stored, encoding };
   await log.putMeta(key, meta);
   await log.append({ type: "blob", data: { key, ...meta } });
+  maintain?.();
   return json({ key, ...meta });
 }
 

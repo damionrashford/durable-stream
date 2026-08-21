@@ -61,10 +61,12 @@ document.addEventListener("visibilitychange", () => {
  * network returns rather than up to 800ms later, and say so when it goes.
  */
 addEventListener("pageshow", (event) => {
-  if (event.persisted) connect(cursor);
+  if (event.persisted && booted) connect(cursor);
 });
 
-addEventListener("online", () => connect(cursor));
+// Guarded on boot: before the worker controls the page, /api/* reaches the
+// network and 404s, which would put the stream into a retry loop.
+addEventListener("online", () => booted && connect(cursor));
 
 addEventListener("offline", () => {
   es?.close();
@@ -139,6 +141,7 @@ feed.addEventListener("click", (event) => {
 
 /* ── control plane ───────────────────────────────────────────────────────── */
 
+let booted = false;
 let es = null;
 let cursor = 0; // highest id this tab has seen; the resume point
 let retry = null;
@@ -160,16 +163,17 @@ function connect(from = cursor) {
 
   es.addEventListener("open", () => setStatus("live", "live"));
 
+  // Named, so it never reaches onmessage and never reaches the read model. The
+  // worker drops events instead of queueing for a reader that has fallen behind;
+  // the log still has them, so resyncing from the cursor loses nothing.
+  es.addEventListener("lagged", () => connect(cursor));
+
   es.onmessage = (e) => {
     const id = Number.parseInt(e.lastEventId, 10);
     if (Number.isFinite(id) && id > cursor) cursor = id;
 
     const { type, data } = JSON.parse(e.data);
     sqlClient.push({ id, type, data });
-
-    // The worker dropped events rather than queue them for a reader that fell
-    // behind. Nothing is lost — the log has them — so resync from our cursor.
-    if (type === "lagged") return void connect(cursor);
 
     const body = row(e.lastEventId, type);
     if (!body) return;
@@ -209,7 +213,7 @@ navigator.serviceWorker.addEventListener("message", async (event) => {
 
   // msg.stream is a LIVE ReadableStream transferred out of the worker. render()
   // decides whether to consume it progressively or collect it, by MIME.
-  await render(body, msg);
+  await render(body, { ...msg, src: api(`api/blob/${msg.key}`) });
 });
 
 function pull(key, body) {
@@ -242,7 +246,7 @@ $("ep-blob").textContent = api("api/blob/:key");
 
 for (const id of ["ep-get", "ep-post", "ep-blob"]) {
   $(id).addEventListener("click", async (e) => {
-    await navigator.clipboard.writeText(e.currentTarget.textContent).catch(() => {});
+    await navigator.clipboard?.writeText(e.currentTarget.textContent).catch(() => {});
     e.currentTarget.dataset.copied = "true";
     setTimeout(() => delete e.currentTarget.dataset.copied, 1200);
   });
@@ -332,6 +336,7 @@ function awaitController(timeout = 3000) {
       (await navigator.storage?.persist?.().catch(() => false));
     durability = persisted ? "persisted" : "evictable";
 
+    booted = true;
     setStatus("wait", "connecting");
     connect();
     refreshStatus();

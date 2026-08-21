@@ -79,7 +79,9 @@ as real once its `blob` event commits.
 | Payloads | OPFS | `createWritable()` is a `WritableStream`, so uploads `pipeTo` disk and never buffer |
 | Read model | SQLite wasm | derived, disposable, rebuilt from the log |
 
-Retention is 5000 events with a harder trim and one retry on `QuotaExceededError`.
+Retention trims the log to 5000 events and sweeps the payloads those events were the
+only reference to, so both halves stay bounded. `QuotaExceededError` triggers a harder
+trim and one retry.
 
 ## Layout
 
@@ -98,7 +100,7 @@ src/
   blobs.js                 OPFS store: compression, ranges, resumable writes
   transport.js             upstream: WebTransport with SSE fallback
   upstream.js              frame routing, cursor, Background Fetch
-  render.js                by MIME: streaming text, buffered media, download
+  render.js                by MIME: streaming text, ranged media, download
   query.js                 page-side client for the read model
 styles/main.css
 ```
@@ -167,7 +169,8 @@ Run against headless Chrome:
 - resume: a server dying at 40% of 2 MB → retry requests `bytes=838860-`, final file
   2,097,152 bytes byte-correct across the seam
 - compression: 10 KB text stored as 82 B, round-tripped exactly; binary left alone
-- data plane: payload → OPFS → transferred stream → rendered
+- data plane: payload → OPFS → transferred stream → rendered; media loads from
+  the ranged URL instead
 - HTTP: `206`, suffix ranges, `416`, `304`, `HEAD` with empty body, `405` with `Allow`
 - log: trim at head 300 leaving floor 206; outbox queued with the sync tag registered
 - multi-tab: a broadcast crossing two tabs; one log, two readers
@@ -175,10 +178,9 @@ Run against headless Chrome:
 
 ## Known limits
 
-- Log growth is bounded by retention, not by size. A large-payload workload can still
-  hit quota between trims.
-- No auth. Any script on the origin can read the log.
-- `WebSocketStream`, Background Fetch, and `FileSystemHandle.remove()` are experimental
-  or non-standard; each is capability-detected with a fallback.
-- Media rendering builds an object URL from a Blob, so it buffers and doesn't use the
-  range support the server side now has.
+- No auth. The origin is the only boundary; any script on it can read the log.
+- Retention is a count, not a size. A workload of large payloads can reach quota
+  between passes, which surfaces as `507` rather than data loss.
+- Cross-origin isolation and the SQL read model cannot both be on.
+
+Working on this? See [AGENTS.md](AGENTS.md).
