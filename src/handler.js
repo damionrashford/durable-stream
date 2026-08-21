@@ -9,6 +9,7 @@
  *   POST /api/events              Append {type, data}. Returns the new id.
  *   PUT  /api/blob/:key           Store a payload; announces it on the log.
  *   GET  /api/blob/:key           Stream it back.
+ *   GET  /api/log                 Whole log as JSON, to backfill the read model.
  *   GET  /api/status              Log head/floor, outbox depth, storage durability.
  */
 
@@ -175,6 +176,19 @@ async function putBlob(request, { log, blobs }, { key }) {
   return json({ key, ...meta });
 }
 
+/**
+ * The whole log as JSON.
+ *
+ * Exists to backfill the SQL read model in one request. Streaming it through
+ * SSE would work but means holding a second connection open just to replay
+ * history that is already complete.
+ */
+async function readLog(_request, { log }) {
+  const events = [];
+  for await (const e of log.since(0)) events.push(e);
+  return json({ floor: await log.floor(), events });
+}
+
 async function getBlob(_request, { log, blobs }, { key }) {
   const meta = (await log.getMeta(key)) ?? {};
   const stream = await blobs.get(key, { encoding: meta.encoding });
@@ -218,6 +232,7 @@ export function createHandler(base, stores) {
     { method: "POST", path: "/api/events", handler: appendEvent },
     { method: "PUT", path: "/api/blob/:key", handler: putBlob },
     { method: "GET", path: "/api/blob/:key", handler: getBlob },
+    { method: "GET", path: "/api/log", handler: readLog },
     { method: "GET", path: "/api/status", handler: status },
   ]);
 

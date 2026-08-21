@@ -5,6 +5,7 @@
  */
 
 import { render } from "./render.js";
+import { createQueryClient } from "./query.js";
 
 const $ = (id) => document.getElementById(id);
 const api = (path) => new URL(path, document.baseURI).href;
@@ -68,6 +69,7 @@ function connect(from = cursor) {
     if (Number.isFinite(id) && id > cursor) cursor = id;
 
     const { type, data } = JSON.parse(e.data);
+    sqlClient.push({ id, type, data });
 
     // The worker dropped events rather than queue them for a reader that fell
     // behind. Nothing is lost — the log has them — so resync from our cursor.
@@ -122,6 +124,22 @@ function pull(meta, body) {
 }
 
 /* ── boot ────────────────────────────────────────────────────────────────── */
+
+/*
+ * SQL over the log, on demand.
+ *
+ *   await sql("select type, count(*) n from events group by type order by n desc")
+ *
+ * Derived, never authoritative: SQLite reaches OPFS only through a dedicated
+ * worker, and the service worker cannot spawn one, so the log stays in IndexedDB
+ * where the worker can serve it. Nothing loads until the first call.
+ */
+const sqlClient = createQueryClient({
+  backfill: async () => (await (await fetch(api("api/log"))).json()).events,
+  base: api("api/log"),
+});
+globalThis.sql = (text, params) => sqlClient.query(text, params);
+globalThis.sql.status = () => sqlClient.status();
 
 $("ep-post").textContent = api("api/events");
 $("ep-blob").textContent = api("api/blob/:key");
