@@ -27,6 +27,12 @@ const CURSOR_FLUSH_MS = 1000;
 const LARGE_PAYLOAD = 8 * 1024 * 1024;
 
 /**
+ * Above this, a payload is stored uncompressed so a failed transfer can resume
+ * from its prefix. Below it, restarting is cheaper than giving up gzip.
+ */
+const RESUMABLE_ABOVE = 1024 * 1024;
+
+/**
  * Idempotent. Safe to call on every request — a service worker is killed when
  * idle, so this is the hook that brings the connection back when it wakes.
  */
@@ -99,8 +105,30 @@ export function ensureUpstream(state, { url, log, blobs, headers = {}, registrat
  * OS-level progress, and wakes us with `backgroundfetchsuccess` when it lands.
  * An inline stream dies with the worker.
  */
-async function receiveBlob(frame, { log, blobs, registration, signal }) {
+/**
+ * Keys currently being written.
+ *
+ * createWritable() commits to a temp file and only lands on close(), so a second
+ * transfer of the same key starting mid-write sees a stale size and resumes from
+ * the wrong offset. One transfer per key at a time removes the question.
+ */
+const inFlight = new Set();
+
+async function receiveBlob(frame, ctx) {
   const key = frame.key ?? crypto.randomUUID();
+  if (inFlight.has(key)) {
+    frame.body?.cancel().catch(() => {});
+    return;
+  }
+  inFlight.add(key);
+  try {
+    await receiveBlobExclusive(key, frame, ctx);
+  } finally {
+    inFlight.delete(key);
+  }
+}
+
+async function receiveBlobExclusive(key, frame, { log, blobs, registration, signal }) {
   const mime = frame.mime || "application/octet-stream";
   const name = frame.name ?? key;
 
@@ -118,19 +146,50 @@ async function receiveBlob(frame, { log, blobs, registration, signal }) {
     }
   }
 
+  // Below this, restarting a failed transfer is cheaper than giving up gzip.
+  const resumable = (frame.size ?? 0) >= RESUMABLE_ABOVE;
+
   // WebTransport hands us the bytes; SSE hands us a reference to go get them.
+  // Only the reference case can resume — a stream that already died is gone.
   let body = frame.body;
+  let offset = 0;
+
   if (!body) {
-    const res = await fetch(frame.href, { signal });
+    const have = resumable ? await blobs.sizeOf(key) : 0;
+    const res = await fetch(frame.href, {
+      signal,
+      headers: have > 0 ? { range: `bytes=${have}-` } : {},
+    });
     if (!res.ok || !res.body) throw new Error(`payload ${res.status}`);
+    // 206 means the server honoured the range and is sending the remainder. A
+    // plain 200 means it ignored it and is resending everything, so start over
+    // rather than append a second copy onto the prefix we already hold.
+    offset = res.status === 206 ? have : 0;
     body = res.body;
   }
 
   // Bytes land first, the log entry commits second. There is no transaction
   // across OPFS and IndexedDB, so the log is the authority: an orphaned file is
   // recoverable garbage, a logged event with no bytes is a broken promise.
-  const { size, stored, encoding } = await blobs.put(key, body, mime);
-  const meta = { name, mime, size: frame.size ?? size, stored, encoding };
+  let result;
+  try {
+    result = await blobs.put(key, body, mime, { offset, resumable });
+  } catch (err) {
+    if (!resumable) {
+      await blobs.delete(key); // no resume path, so a prefix is only garbage
+      throw err;
+    }
+    // Keep the prefix and record how far it got. The next announcement of this
+    // key picks up from there instead of starting at zero.
+    await log.putMeta(key, { name, mime, size: frame.size, partial: await blobs.sizeOf(key) });
+    await log.append({
+      type: "blob-partial",
+      data: { key, name, have: await blobs.sizeOf(key), of: frame.size ?? null },
+    });
+    throw err;
+  }
+
+  const meta = { name, mime, size: frame.size ?? result.size, stored: result.stored, encoding: result.encoding };
   await log.putMeta(key, meta);
   await log.append({ type: "blob", data: { key, ...meta } });
 }

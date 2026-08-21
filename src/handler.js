@@ -196,13 +196,20 @@ async function getBlob(_request, { log, blobs }, { key }) {
  * rather than assuming.
  */
 async function status(_request, { log, blobs, storageStatus }) {
-  const [head, floor, keys, storage] = await Promise.all([
+  const [head, floor, files, storage] = await Promise.all([
     log.head(),
     log.floor(),
-    blobs.keys(),
+    blobs.list(),
     storageStatus(),
   ]);
-  return json({ head, floor, blobs: keys.length, outbox: (await log.pending()).length, storage });
+  return json({
+    head,
+    floor,
+    blobs: files.length,
+    bytes: files.reduce((n, f) => n + f.stored, 0),
+    outbox: (await log.pending()).length,
+    storage,
+  });
 }
 
 export function createHandler(base, stores) {
