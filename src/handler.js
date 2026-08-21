@@ -189,16 +189,87 @@ async function readLog(_request, { log }) {
   return json({ floor: await log.floor(), events });
 }
 
-async function getBlob(_request, { log, blobs }, { key }) {
-  const meta = (await log.getMeta(key)) ?? {};
-  const stream = await blobs.get(key, { encoding: meta.encoding });
-  if (!stream) return json({ error: meta.pending ? "still downloading" : "not found" }, 404);
+/** `bytes=start-end`, single range only. Returns null when unusable. */
+function parseRange(header, size) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec((header ?? "").trim());
+  if (!m) return null;
+  const [, rawStart, rawEnd] = m;
 
-  // Lazy: bytes come off disk as the consumer reads. No content-length when the
-  // payload was compressed — the on-disk size is not the decoded size, and a
-  // wrong one is worse than none.
-  const headers = { "content-type": meta.mime || "application/octet-stream" };
-  if (!meta.encoding && meta.size) headers["content-length"] = String(meta.size);
+  // A suffix range ("bytes=-500") means the last N bytes.
+  let start = rawStart === "" ? size - Number(rawEnd) : Number(rawStart);
+  let end = rawStart === "" || rawEnd === "" ? size - 1 : Number(rawEnd);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  start = Math.max(0, start);
+  end = Math.min(size - 1, end);
+  if (start > end) return null;
+  return { start, end };
+}
+
+/**
+ * Serve a payload, honouring conditional and range requests.
+ *
+ * Range support is what makes a media element seekable — without 206 a <video>
+ * can only play a payload from the start. It is offered only for uncompressed
+ * files: a byte range of gzip'd data is not a byte range of its contents, and
+ * decompressing to slice would buffer the whole thing. By the resumable rule
+ * the uncompressed ones are the large ones, which is where seeking matters.
+ *
+ * The ETag is strong: keys are content-addressed and never rewritten, so key
+ * plus stored length identifies the bytes exactly.
+ */
+async function getBlob(request, { log, blobs }, { key }) {
+  const meta = (await log.getMeta(key)) ?? {};
+  const file = await blobs.file(key);
+  if (!file) return json({ error: meta.pending ? "still downloading" : "not found" }, 404);
+
+  const compressed = meta.encoding === "gzip";
+  const etag = `"${key}-${file.size}"`;
+  const mime = meta.mime || "application/octet-stream";
+
+  // Nothing has changed and the client already has it.
+  if (request.headers.get("if-none-match") === etag) {
+    return new Response(null, { status: 304, headers: { etag, "cache-control": "no-cache" } });
+  }
+
+  const base = {
+    etag,
+    "content-type": mime,
+    // Content-addressed and never rewritten, but revalidation is free and keeps
+    // a deleted key from being served from cache forever.
+    "cache-control": "no-cache",
+    "accept-ranges": compressed ? "none" : "bytes",
+  };
+
+  const range = compressed ? null : parseRange(request.headers.get("range"), file.size);
+  if (range) {
+    const { start, end } = range;
+    // slice() is lazy — the bytes are not read until the body is consumed.
+    return new Response(file.slice(start, end + 1).stream(), {
+      status: 206,
+      headers: {
+        ...base,
+        "content-range": `bytes ${start}-${end}/${file.size}`,
+        "content-length": String(end - start + 1),
+      },
+    });
+  }
+
+  if (request.headers.get("range") && !compressed) {
+    // Syntactically present but unsatisfiable.
+    return new Response(null, {
+      status: 416,
+      headers: { ...base, "content-range": `bytes */${file.size}` },
+    });
+  }
+
+  const stream = compressed
+    ? file.stream().pipeThrough(new DecompressionStream("gzip"))
+    : file.stream();
+
+  const headers = { ...base };
+  // No content-length when compressed: the on-disk size is not the decoded size,
+  // and a wrong one is worse than none.
+  if (!compressed) headers["content-length"] = String(file.size);
   return new Response(stream, { headers });
 }
 
@@ -237,9 +308,23 @@ export function createHandler(base, stores) {
   ]);
 
   /** Returns null when the route isn't ours, so the caller can fall through. */
-  return function handle(request) {
+  return async function handle(request) {
     const hit = match(request);
     if (!hit) return null;
-    return Promise.resolve(hit.handler(request, stores, hit.params));
+
+    if (hit.allow) {
+      return new Response(null, {
+        status: 405,
+        headers: { allow: hit.allow.join(", "), "cache-control": "no-store" },
+      });
+    }
+
+    const response = await hit.handler(request, stores, hit.params);
+    if (!hit.bodyless) return response;
+
+    // HEAD: identical headers and status, body discarded. Cancelling rather than
+    // ignoring it means the payload is never read off disk.
+    response.body?.cancel().catch(() => {});
+    return new Response(null, { status: response.status, headers: response.headers });
   };
 }

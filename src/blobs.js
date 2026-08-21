@@ -89,6 +89,21 @@ export async function openBlobStore() {
       return encoding === "gzip" ? stream.pipeThrough(new DecompressionStream("gzip")) : stream;
     },
 
+    /**
+     * The File itself, for callers that need to slice it.
+     *
+     * Only meaningful for uncompressed payloads: a byte range of a gzip'd file
+     * is not a byte range of its contents, so range serving is restricted to
+     * those — which, by the resumable rule, are exactly the large ones.
+     */
+    async file(key) {
+      try {
+        return await (await store.getFileHandle(key)).getFile();
+      } catch {
+        return null;
+      }
+    },
+
     /** Bytes already on disk for this key. The resume point. */
     async sizeOf(key) {
       try {
