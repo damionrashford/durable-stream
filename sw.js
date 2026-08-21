@@ -31,7 +31,7 @@ import { ensureUpstream } from "./src/upstream.js";
  * direction that works — the worker dials out and holds the socket, and whatever
  * arrives is appended to the log that every tab already reads.
  */
-const UPSTREAM = "http://localhost:4400/";
+const UPSTREAM = "";
 const UPSTREAM_HEADERS = {};
 
 const OUTBOX_TAG = "outbox";
