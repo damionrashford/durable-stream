@@ -221,7 +221,7 @@ async function receiveBlobExclusive(key, frame, { log, blobs, registration, sign
     size: result.size,
     stored: result.stored,
     encoding: result.encoding,
-    crc: result.partial ? null : result.crc,
+    sha256: result.sha256,
   };
   await log.putMeta(key, meta);
   await log.append({ type: "blob", data: { key, ...meta } });

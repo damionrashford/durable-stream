@@ -78,6 +78,7 @@ as real once its `blob` event commits.
 |---|---|---|
 | Event log | IndexedDB | the autoIncrement key *is* the cursor; range queries; reachable from the worker |
 | Payloads | OPFS | `createWritable()` is a `WritableStream`, so uploads `pipeTo` disk and never buffer |
+| Integrity | streaming SHA-256 | standard digest, so an upstream can verify it with any tool |
 | Read model | SQLite wasm | derived, disposable, rebuilt from the log |
 | App shell | Cache Storage | so there is something to read the log *with* offline |
 
@@ -202,9 +203,10 @@ Run against headless Chrome:
 ## Known limits
 
 - No auth. The origin is the only boundary; any script on it can read the log.
-- Payload integrity is a CRC-32, which catches truncation and a bad resume, not
-  tampering. `crypto.subtle` has no streaming digest, and collecting a payload to
-  hash it would undo the reason it is streamed.
+- A payload above the free quota cannot be stored at all, and there is no way to
+  ask for more: OPFS, IndexedDB, Cache Storage and every storage bucket draw on
+  one origin allowance, and `estimate()` reports the whole of it. Reaching the
+  user's own disk needs the File System Access API and a user gesture.
 - Retention is enforced two ways — a count on the log and a byte budget on
   payloads — but a single payload larger than the remaining quota still cannot
   be stored, and answers `507`.

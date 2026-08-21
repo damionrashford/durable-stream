@@ -10,6 +10,8 @@
  * [Exposed=DedicatedWorker], so it is unreachable from a service worker.
  */
 
+import { hashingStream } from "./sha256.js";
+
 const DIR = "blobs";
 
 /**
@@ -41,26 +43,6 @@ async function rootDirectory() {
 /** Types where gzip pays for itself. Media and archives are already compressed. */
 const COMPRESSIBLE =
   /^(text\/|application\/(json|xml|javascript|x-ndjson|wasm)|image\/svg\+xml)/;
-
-/*
- * CRC-32, computed as the bytes go past.
- *
- * SubtleCrypto has no streaming digest, and collecting a payload to hash it
- * would undo the reason it is streamed. A checksum is enough for what can
- * actually go wrong here: a truncated transfer, or a resume that appended at
- * the wrong offset. Neither is adversarial, and both change the bytes.
- */
-const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, n) => {
-  let c = n;
-  for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  return c >>> 0;
-});
-
-function crc32(previous, bytes) {
-  let c = (previous ^ 0xffffffff) >>> 0;
-  for (let i = 0; i < bytes.length; i += 1) c = (CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8)) >>> 0;
-  return (c ^ 0xffffffff) >>> 0;
-}
 
 async function openDir() {
   const root = await rootDirectory();
@@ -96,12 +78,12 @@ export async function openBlobStore() {
       // the stored size rather than the payload's real length, and the real
       // length is what a caller means by "how big is this".
       let received = 0;
-      let crc = 0;
+      const hasher = hashingStream();
       const measured = stream.pipeThrough(
         new TransformStream({
           transform(chunk, controller) {
             received += chunk.byteLength ?? chunk.length ?? 0;
-            crc = crc32(crc, chunk);
+            hasher.update(chunk);
             controller.enqueue(chunk);
           },
         }),
@@ -116,14 +98,15 @@ export async function openBlobStore() {
       // contents intact, which is exactly what a resume needs.
       await body.pipeTo(writable);
 
-      // With an offset the checksum covers only the appended part, so it is
-      // reported as partial rather than pretending to describe the whole file.
+      const { hash, via } = await hasher.digest();
       return {
         size: offset + received,
         stored: (await file.getFile()).size,
         encoding,
-        crc,
-        partial: resuming,
+        // A resume hashes only what it appended, so the digest describes the
+        // whole payload only when the write started at zero.
+        sha256: resuming ? null : hash,
+        hashedVia: via,
       };
     },
 
@@ -157,6 +140,14 @@ export async function openBlobStore() {
       } catch {
         return null;
       }
+    },
+
+    /** Cut a partial file back to a known-good length. */
+    async truncate(key, size) {
+      const file = await store.getFileHandle(key, { create: true });
+      const writable = await file.createWritable({ keepExistingData: true });
+      await writable.write({ type: "truncate", size });
+      await writable.close();
     },
 
     /** Bytes already on disk for this key. The resume point. */
@@ -258,21 +249,23 @@ export async function openBlobStore() {
  * best-effort means the source of truth is deletable.
  */
 export async function storageStatus() {
-  const { usage = 0, quota = 0 } = (await navigator.storage?.estimate?.()) ?? {};
+  const { usage = 0, quota = 0, usageDetails: breakdown = null } =
+    (await navigator.storage?.estimate?.()) ?? {};
   const persisted = (await navigator.storage?.persisted?.()) ?? false;
 
-  // estimate() reports the bucket it is called on, so payloads in their own
-  // bucket are not in the number above. Reported separately rather than summed:
-  // the point of the split is that the two are evicted independently.
+  // navigator.storage.estimate() covers the whole origin, other buckets
+  // included, so the payload figure is a breakdown of `usage` and not an
+  // addition to it. Separate buckets divide one allowance; they do not grant a
+  // second one, and neither does spreading across OPFS, IndexedDB and Cache.
   let payloads = null;
   if (navigator.storageBuckets) {
     try {
       const bucket = await navigator.storageBuckets.open(BUCKET, { durability: "relaxed" });
       payloads = (await bucket.estimate()).usage ?? null;
     } catch {
-      // No separate bucket; payload bytes are inside `usage`.
+      // No separate bucket; payload bytes are still inside `usage`.
     }
   }
 
-  return { usage, quota, persisted, payloads, pressure: quota ? usage / quota : 0 };
+  return { usage, quota, persisted, payloads, breakdown, pressure: quota ? usage / quota : 0 };
 }
