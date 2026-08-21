@@ -15,6 +15,34 @@
 
 const CDN = "https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.53.0-build1/dist/index.mjs";
 
+/** Held by whichever context owns the on-disk database. */
+const PERSISTENT_LOCK = "stream-read-model";
+
+/**
+ * Take a lock and keep it, or report immediately that someone else has it.
+ *
+ * navigator.locks releases when its callback settles, so holding one across the
+ * lifetime of a resource means handing back a release function and leaving the
+ * callback pending until it is called.
+ */
+async function elect(name) {
+  if (!navigator.locks) return { release() {} };
+  let release;
+  const granted = new Promise((resolve) => {
+    navigator.locks
+      .request(name, { ifAvailable: true }, (lock) => {
+        if (!lock) return void resolve(null);
+        return new Promise((done) => {
+          release = done;
+          resolve({ release: done });
+        });
+      })
+      .catch(() => resolve(null));
+  });
+  const held = await granted;
+  return held ?? null;
+}
+
 const SCHEMA = `
   create table if not exists events (
     id    integer primary key,
@@ -34,15 +62,31 @@ async function open() {
 
   let db;
   let storage;
-  try {
-    // Second and later tabs lose the exclusive file lock and land in memory.
-    // That is the documented behaviour, not a failure to work around.
-    const pool = await sqlite3.installOpfsSAHPoolVfs({ name: "stream-read-model" });
-    db = new pool.OpfsSAHPoolDb("/log.sqlite3");
-    storage = "opfs-sahpool";
-  } catch (err) {
+
+  // The sahpool VFS takes an exclusive lock on its files, so exactly one context
+  // may hold the persistent database. Electing that context with a Web Lock
+  // makes which one deterministic and lets the others fall back immediately,
+  // instead of racing for the file and reporting whatever they happen to get.
+  //
+  // The lock is held for as long as the database is open, so the callback
+  // returns a promise that only settles when this worker is torn down.
+  const elected = await elect(PERSISTENT_LOCK);
+
+  if (elected) {
+    try {
+      const pool = await sqlite3.installOpfsSAHPoolVfs({ name: "stream-read-model" });
+      db = new pool.OpfsSAHPoolDb("/log.sqlite3");
+      storage = "opfs-sahpool";
+    } catch (err) {
+      elected.release();
+      db = new sqlite3.oo1.DB(":memory:", "c");
+      storage = `memory (${err?.message ?? "opfs unavailable"})`;
+    }
+  } else {
+    // Another context holds the persistent database. This one is still fully
+    // functional; the log rebuilds it on every start.
     db = new sqlite3.oo1.DB(":memory:", "c");
-    storage = `memory (${err?.message ?? "opfs unavailable"})`;
+    storage = "memory (persistent copy held elsewhere)";
   }
 
   db.exec(SCHEMA);

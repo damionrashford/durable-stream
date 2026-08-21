@@ -36,13 +36,23 @@ let scheduled = 0;
 
 /*
  * requestAnimationFrame does not fire in a hidden tab, so scheduling on it alone
- * means a backgrounded tab renders nothing and stages rows forever. Frames when
- * visible, a timer when not, and a flush the moment visibility returns.
+ * means a backgrounded tab renders nothing and stages rows forever.
+ *
+ * Visible: a frame, because the work is a paint and should land with one.
+ * Hidden: a background task, which yields to anything the user can perceive,
+ * falling back to a timer where the scheduler is unavailable.
  */
 function schedule() {
   if (scheduled) return;
-  scheduled =
-    document.visibilityState === "visible" ? requestAnimationFrame(flush) : setTimeout(flush, 250);
+  scheduled = 1;
+
+  if (document.visibilityState === "visible") {
+    requestAnimationFrame(flush);
+  } else if (globalThis.scheduler?.postTask) {
+    scheduler.postTask(flush, { priority: "background", delay: 250 }).catch(() => {});
+  } else {
+    setTimeout(flush, 250);
+  }
 }
 
 document.addEventListener("visibilitychange", () => {

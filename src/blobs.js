@@ -12,12 +12,38 @@
 
 const DIR = "blobs";
 
+/**
+ * Payloads live in their own storage bucket where one is available.
+ *
+ * A bucket carries its own eviction policy. The log stays in the default bucket
+ * and asks to be persisted; payloads go here and deliberately do not. Under
+ * quota pressure the browser sheds this bucket first, so the derived data goes
+ * and the source of truth stays — which retention alone cannot arrange, because
+ * retention runs on our schedule and eviction runs on the browser's.
+ *
+ * "relaxed" durability suits payloads: they are announced by the log and any
+ * loss shows up as a missing key, which is already a handled case.
+ */
+const BUCKET = "payloads";
+
+async function rootDirectory() {
+  if (navigator.storageBuckets) {
+    try {
+      const bucket = await navigator.storageBuckets.open(BUCKET, { durability: "relaxed" });
+      return bucket.getDirectory();
+    } catch {
+      // Unsupported or refused; the default bucket still works.
+    }
+  }
+  return navigator.storage.getDirectory();
+}
+
 /** Types where gzip pays for itself. Media and archives are already compressed. */
 const COMPRESSIBLE =
   /^(text\/|application\/(json|xml|javascript|x-ndjson|wasm)|image\/svg\+xml)/;
 
 async function openDir() {
-  const root = await navigator.storage.getDirectory();
+  const root = await rootDirectory();
   return root.getDirectoryHandle(DIR, { create: true });
 }
 
@@ -178,5 +204,19 @@ export async function openBlobStore() {
 export async function storageStatus() {
   const { usage = 0, quota = 0 } = (await navigator.storage?.estimate?.()) ?? {};
   const persisted = (await navigator.storage?.persisted?.()) ?? false;
-  return { usage, quota, persisted, pressure: quota ? usage / quota : 0 };
+
+  // estimate() reports the bucket it is called on, so payloads in their own
+  // bucket are not in the number above. Reported separately rather than summed:
+  // the point of the split is that the two are evicted independently.
+  let payloads = null;
+  if (navigator.storageBuckets) {
+    try {
+      const bucket = await navigator.storageBuckets.open(BUCKET, { durability: "relaxed" });
+      payloads = (await bucket.estimate()).usage ?? null;
+    } catch {
+      // No separate bucket; payload bytes are inside `usage`.
+    }
+  }
+
+  return { usage, quota, persisted, payloads, pressure: quota ? usage / quota : 0 };
 }

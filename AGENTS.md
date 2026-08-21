@@ -35,9 +35,17 @@ Breaking any of these breaks the system silently rather than loudly.
 7. **`requestAnimationFrame` does not fire in a hidden tab.** Anything scheduling
    render work needs a timer fallback.
 
-8. **Adding a page module means adding it to `SHELL`.** Anything left out loads
-   from the network, so the app breaks offline in exactly one place. Bump
-   `VERSION` when shell contents change; entries are served cache-first.
+8. **Adding a page module means adding it to `SHELL`, and bumping `VERSION`.**
+   Nothing is cached opportunistically, on purpose: a response cached because it
+   went past keeps being served after the file changes, and for a module that
+   means running code no longer in the repo. It presents as the edit simply not
+   happening. Anything absent from `SHELL` always comes from the network and so
+   is unavailable offline.
+
+9. **Cross-context coordination uses Web Locks, not a module-scope Set.** A Set
+   lives exactly as long as the worker instance holding it, and every tab has
+   its own. `payload:<key>` serialises payload writes; `stream-read-model`
+   elects the one context allowed to open the on-disk SQLite database.
 
 ## Layers
 

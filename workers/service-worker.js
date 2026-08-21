@@ -42,7 +42,7 @@ const OUTBOX_TAG = "outbox";
  * fails before any of this runs. Bump VERSION to invalidate; entries are
  * served cache-first, so an edit is otherwise invisible to a controlled page.
  */
-const VERSION = "shell-v1";
+const VERSION = "shell-v2";
 const SHELL = [
   "./",
   "./index.html",
@@ -57,6 +57,7 @@ const SHELL = [
   "./src/blobs.js",
   "./src/transport.js",
   "./src/upstream.js",
+  "./workers/query.js",
 ];
 
 /** Minimum gap between retention passes. */
@@ -197,10 +198,16 @@ self.addEventListener("fetch", (event) => {
 });
 
 /*
- * Cache-first for the shell, which never changes within a VERSION. Anything
- * else falls through to the network and is cached on the way past, so a second
- * visit works offline. A navigation with no cache entry and no network falls
- * back to the entry document rather than a browser error page.
+ * Cache-first, but only for what SHELL named.
+ *
+ * Nothing is cached opportunistically. A response cached because it happened to
+ * go past is a response that keeps being served after the file changes, and for
+ * a module that means running code that no longer exists in the repo — a class
+ * of bug that presents as the change simply not happening. What ships offline
+ * is the explicit list, and everything else always comes from the network.
+ *
+ * A navigation with no network falls back to the entry document rather than a
+ * browser error page.
  */
 async function serveShell(event) {
   const cached = await caches.match(event.request, { ignoreSearch: true });
@@ -208,12 +215,7 @@ async function serveShell(event) {
 
   try {
     // Already in flight alongside worker boot, if navigation preload applied.
-    const response = (await event.preloadResponse) || (await fetch(event.request));
-    if (response.ok && event.request.mode !== "navigate") {
-      const copy = response.clone();
-      event.waitUntil(caches.open(VERSION).then((c) => c.put(event.request, copy)));
-    }
-    return response;
+    return (await event.preloadResponse) || (await fetch(event.request));
   } catch (err) {
     if (event.request.mode === "navigate") {
       const shell = await caches.match("./index.html", { ignoreSearch: true });

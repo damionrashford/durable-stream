@@ -97,26 +97,27 @@ export function ensureUpstream(state, { url, log, blobs, headers = {}, registrat
 }
 
 /**
- * Keys currently being written.
+ * One transfer per key at a time.
  *
  * createWritable() commits to a temp file and only lands on close(), so a second
- * transfer of the same key starting mid-write sees a stale size and resumes from
- * the wrong offset. One transfer per key at a time removes the question.
+ * transfer of the same key starting mid-write reads a stale size and resumes
+ * from the wrong offset. A Web Lock covers every context on the origin, which a
+ * per-instance Set does not — and this worker is restarted often enough that a
+ * Set is exactly as durable as the instance holding it.
  */
-const inFlight = new Set();
-
 async function receiveBlob(frame, ctx) {
   const key = frame.key ?? crypto.randomUUID();
-  if (inFlight.has(key)) {
-    frame.body?.cancel().catch(() => {});
-    return;
-  }
-  inFlight.add(key);
-  try {
+
+  if (!navigator.locks) return receiveBlobExclusive(key, frame, ctx);
+
+  await navigator.locks.request(`payload:${key}`, { ifAvailable: true }, async (lock) => {
+    if (!lock) {
+      // Another context is already writing this key.
+      frame.body?.cancel().catch(() => {});
+      return;
+    }
     await receiveBlobExclusive(key, frame, ctx);
-  } finally {
-    inFlight.delete(key);
-  }
+  });
 }
 
 /**
