@@ -10,10 +10,30 @@
  */
 
 const DB_NAME = "stream-log";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const EVENTS = "events";
 const META = "blob-meta";
 const OUTBOX = "outbox";
+
+/**
+ * Event types that make a payload key reachable.
+ *
+ * `blob-partial` belongs here as much as the other two. It says a transfer
+ * stopped with bytes on disk and records where to continue, so the key is
+ * referenced even though no complete payload exists yet — and sweeping its
+ * prefix while the log still points at it is what turns a resume into a write
+ * over bytes that are no longer there.
+ */
+const BLOB_TYPES = ["blob", "blob-pending", "blob-partial"];
+
+/**
+ * Metadata keys belonging to the log itself rather than to a payload.
+ *
+ * The store is shared: `__floor` and `__upstream_cursor` live alongside one
+ * record per payload key. Pruning has to be able to tell them apart, so the
+ * prefix is reserved and payload keys must not use it.
+ */
+const RESERVED = /^__/;
 
 /** Events kept before the tail is trimmed. The log is not infinite storage. */
 const RETENTION = 5000;
@@ -30,6 +50,12 @@ function open() {
       if (!db.objectStoreNames.contains(EVENTS)) {
         db.createObjectStore(EVENTS, { keyPath: "id", autoIncrement: true });
       }
+      // Reachability is recomputed on every maintenance pass, and without this
+      // that means reading every event to find the few that name a payload.
+      // Created here rather than at first use because an index is schema.
+      const events = req.transaction.objectStore(EVENTS);
+      if (!events.indexNames.contains("type")) events.createIndex("type", "type");
+
       if (!db.objectStoreNames.contains(META)) db.createObjectStore(META, { keyPath: "key" });
       if (!db.objectStoreNames.contains(OUTBOX)) {
         db.createObjectStore(OUTBOX, { keyPath: "id", autoIncrement: true });
@@ -161,9 +187,17 @@ export async function openLog() {
       const seen = new Set();
       const hashes = new Map();
 
-      for await (const e of api.since(0)) {
-        if (e.type !== "blob" && e.type !== "blob-pending") continue;
+      // One index range per blob type, all issued before the first await so the
+      // transaction stays alive. An index yields its own key order, so the
+      // three runs are merged back into log order — which is what decides
+      // which reference to an object counts as its newest.
+      const tx = db.transaction(EVENTS, "readonly");
+      const index = tx.objectStore(EVENTS).index("type");
+      const perType = await Promise.all(
+        BLOB_TYPES.map((type) => request(index.getAll(IDBKeyRange.only(type)))),
+      );
 
+      for (const e of perType.flat().sort((a, b) => a.id - b.id)) {
         const key = e.data?.key;
         if (key && !seen.has(key)) {
           seen.add(key);
@@ -195,6 +229,39 @@ export async function openLog() {
       await done(tx);
       channel.postMessage({ type: "trimmed", floor });
       return floor;
+    },
+
+    /**
+     * Drop metadata for keys no surviving event mentions.
+     *
+     * The log is append-only; this store is not, and that seam leaks. `trim`
+     * removes the events but a key's metadata is written in place and outlives
+     * them, so without this there is one record per payload key ever seen,
+     * forever — the growth retention exists to prevent, reintroduced on the
+     * mutable side.
+     *
+     * It also settles what a trimmed key means. Metadata alone would still
+     * resolve an address whose object sweep has already collected, which reads
+     * as a payload that exists until you ask for it. Removing both together
+     * makes the answer simply "unknown key".
+     *
+     * One transaction: the keys are read and the deletes are issued in the same
+     * synchronous continuation, so nothing can write a key in between and have
+     * it collected by a decision made before it existed.
+     */
+    async pruneMeta(liveKeys) {
+      const keep = new Set(liveKeys);
+      const tx = db.transaction(META, "readwrite");
+      const store = tx.objectStore(META);
+
+      let removed = 0;
+      for (const key of await request(store.getAllKeys())) {
+        if (RESERVED.test(key) || keep.has(key)) continue;
+        store.delete(key);
+        removed += 1;
+      }
+      await done(tx);
+      return removed;
     },
 
     /** Oldest id still retained. Below this, history is gone. */

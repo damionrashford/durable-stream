@@ -122,7 +122,21 @@ export async function openBlobStore() {
       // Progress with no complete block is not a resume point — it is a start.
       // Honouring it anyway would adopt its encoding, and an empty record's
       // encoding is null, which would store a compressible payload raw.
-      const resume = from?.blocks?.length ? from : null;
+      let resume = from?.blocks?.length ? from : null;
+
+      // The log says where the last attempt stopped; only the file can say
+      // whether those bytes are still here. A prefix can be swept between
+      // attempts, and seeking past the end of a file that is shorter than
+      // claimed pads it with NULs — which the hash would not notice, because it
+      // continues from the saved state rather than from what is on disk. The
+      // result would be a zero-prefixed file promoted under a valid content
+      // address. Longer than claimed is fine: that is a short final block from
+      // a clean early close, and the seek truncates it away.
+      if (resume) {
+        const staged = await fileHandle(staging, key);
+        const have = staged ? (await staged.getFile()).size : 0;
+        if (have < resume.blocks.reduce((n, v) => n + v, 0)) resume = null;
+      }
 
       // A resumed write must use whatever the first attempt chose; a file cannot
       // be half raw and half compressed.

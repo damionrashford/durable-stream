@@ -92,7 +92,8 @@ resume from its prefix and serve a byte range — see `src/blocks.js`. A block b
 also a SHA-256 block boundary, so a transfer that dies can carry its digest state
 forward and still arrive at the standard hash of the whole payload.
 
-Retention trims the log to 5000 events, sweeps payloads no surviving event references,
+Retention trims the log to 5000 events, prunes the metadata those events justified,
+sweeps payloads no surviving event references,
 and evicts oldest-first to hold payloads under a byte budget — a count says nothing
 about size, so both are enforced. A write above 80% of quota reclaims space before
 trying, which turns a failure between scheduled passes into a slower write that

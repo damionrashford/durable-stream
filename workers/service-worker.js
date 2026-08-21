@@ -42,7 +42,7 @@ const OUTBOX_TAG = "outbox";
  * fails before any of this runs. Bump VERSION to invalidate; entries are
  * served cache-first, so an edit is otherwise invisible to a controlled page.
  */
-const VERSION = "shell-v14";
+const VERSION = "shell-v15";
 const SHELL = [
   "./",
   "./index.html",
@@ -126,6 +126,10 @@ function boot() {
       // Keys name transfers, hashes name objects, and one object can back
       // several keys — so what is reachable has to be gathered as both.
       const { keys, hashes } = await log.liveObjects();
+      // Metadata is written in place, so trimming the events that justified a
+      // key leaves the key behind. Pruned from the same reachability set that
+      // drives the sweep, so the two can never disagree about what is live.
+      await log.pruneMeta(keys);
       await blobs.sweep(hashes, keys);
       // Count-based retention says nothing about size, so the byte budget runs
       // every pass rather than only when the log happened to be trimmed.
