@@ -174,8 +174,9 @@ async function putBlob(request, { log, blobs, maintain, storageStatus }, { key }
   let size;
   let stored;
   let encoding;
+  let crc;
   try {
-    ({ size, stored, encoding } = await blobs.put(key, request.body, mime));
+    ({ size, stored, encoding, crc } = await blobs.put(key, request.body, mime));
   } catch (err) {
     if (!isQuota(err)) throw err;
     // blobs.put() removed the partial file, so the store is consistent. One
@@ -184,7 +185,7 @@ async function putBlob(request, { log, blobs, maintain, storageStatus }, { key }
     return json({ error: "quota exceeded", key }, 507);
   }
 
-  const meta = { name, mime, size, stored, encoding };
+  const meta = { name, mime, size, stored, encoding, crc };
   await log.putMeta(key, meta);
   await log.append({ type: "blob", data: { key, ...meta } });
   maintain?.();

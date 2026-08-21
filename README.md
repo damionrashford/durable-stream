@@ -202,6 +202,9 @@ Run against headless Chrome:
 ## Known limits
 
 - No auth. The origin is the only boundary; any script on it can read the log.
+- Payload integrity is a CRC-32, which catches truncation and a bad resume, not
+  tampering. `crypto.subtle` has no streaming digest, and collecting a payload to
+  hash it would undo the reason it is streamed.
 - Retention is enforced two ways — a count on the log and a byte budget on
   payloads — but a single payload larger than the remaining quota still cannot
   be stored, and answers `507`.

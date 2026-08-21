@@ -201,7 +201,28 @@ async function receiveBlobExclusive(key, frame, { log, blobs, registration, sign
     throw err;
   }
 
-  const meta = { name, mime, size: frame.size ?? result.size, stored: result.stored, encoding: result.encoding };
+  // A transfer that ended early, or a resume that appended at the wrong offset,
+  // both produce a file of the wrong length. Announced size is the only
+  // independent statement of what the bytes should be, so it is checked rather
+  // than trusted, and a mismatch keeps the prefix for another attempt instead of
+  // logging a payload that is quietly wrong.
+  if (frame.size && result.size !== frame.size) {
+    await log.putMeta(key, { name, mime, size: frame.size, partial: await blobs.sizeOf(key) });
+    await log.append({
+      type: "blob-partial",
+      data: { key, name, have: result.size, of: frame.size },
+    });
+    throw new Error(`payload ${key}: expected ${frame.size} bytes, stored ${result.size}`);
+  }
+
+  const meta = {
+    name,
+    mime,
+    size: result.size,
+    stored: result.stored,
+    encoding: result.encoding,
+    crc: result.partial ? null : result.crc,
+  };
   await log.putMeta(key, meta);
   await log.append({ type: "blob", data: { key, ...meta } });
 }

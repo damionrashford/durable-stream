@@ -231,6 +231,14 @@ function pull(key, body) {
   body.textContent = "pulling…";
   pending.set(key, body);
   navigator.serviceWorker.controller?.postMessage({ type: "pull", key });
+
+  // The worker can be killed mid-pull, in which case no reply is coming. Without
+  // this the entry stays in the map and the row reads "pulling…" forever.
+  setTimeout(() => {
+    if (!pending.has(key)) return;
+    pending.delete(key);
+    body.textContent = "no response — the worker was restarted";
+  }, 20_000);
 }
 
 /* ── boot ────────────────────────────────────────────────────────────────── */
@@ -288,7 +296,12 @@ if ("BroadcastChannel" in window) {
     if (e.data?.type === "append" && e.data.id > cursor && es?.readyState !== EventSource.OPEN) {
       connect(cursor);
     }
-    if (e.data?.type === "trimmed") refreshStatus();
+    if (e.data?.type === "trimmed") {
+      refreshStatus();
+      // The read model holds rows for events the log has now dropped. It is
+      // derived, so the cheap correction is to discard it and replay.
+      sqlClient.resync().catch(() => {});
+    }
   });
 }
 

@@ -42,7 +42,7 @@ const OUTBOX_TAG = "outbox";
  * fails before any of this runs. Bump VERSION to invalidate; entries are
  * served cache-first, so an edit is otherwise invisible to a controlled page.
  */
-const VERSION = "shell-v10";
+const VERSION = "shell-v12";
 const SHELL = [
   "./",
   "./index.html",
@@ -141,6 +141,10 @@ function boot() {
       });
       return force ? maintaining : undefined;
     };
+
+    // Anything left queued by a previous instance, or by a browser without
+    // Background Sync, gets its chance the moment this worker wakes.
+    if ((await log.pending()).length) flushOutbox().catch(() => {});
 
     return {
       log,
@@ -292,16 +296,26 @@ async function transferBlob(key, client) {
 /* ── deferred work ───────────────────────────────────────────────────────── */
 
 /**
- * Fires when connectivity returns, whether or not a page is open. This is the
- * only path by which locally-produced events reach a server after being created
- * offline — a plain fetch at the time would simply have failed.
+ * Background Sync fires when connectivity returns whether or not a page is open,
+ * which is the best trigger available — but it does not exist outside Chromium,
+ * and registering it is allowed to fail silently. On its own it would mean the
+ * outbox never drains at all in those browsers, so the same flush also runs on
+ * boot and whenever a request arrives while items are queued.
  */
 self.addEventListener("sync", (event) => {
   if (event.tag !== OUTBOX_TAG) return;
   event.waitUntil(flushOutbox(event.lastChance));
 });
 
+let flushing = null;
+
 async function flushOutbox(lastChance = false) {
+  if (flushing) return flushing;
+  flushing = drainOutbox(lastChance).finally(() => (flushing = null));
+  return flushing;
+}
+
+async function drainOutbox(lastChance) {
   const { log } = await boot();
 
   for (const op of await log.pending()) {

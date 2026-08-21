@@ -42,6 +42,26 @@ async function rootDirectory() {
 const COMPRESSIBLE =
   /^(text\/|application\/(json|xml|javascript|x-ndjson|wasm)|image\/svg\+xml)/;
 
+/*
+ * CRC-32, computed as the bytes go past.
+ *
+ * SubtleCrypto has no streaming digest, and collecting a payload to hash it
+ * would undo the reason it is streamed. A checksum is enough for what can
+ * actually go wrong here: a truncated transfer, or a resume that appended at
+ * the wrong offset. Neither is adversarial, and both change the bytes.
+ */
+const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+
+function crc32(previous, bytes) {
+  let c = (previous ^ 0xffffffff) >>> 0;
+  for (let i = 0; i < bytes.length; i += 1) c = (CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8)) >>> 0;
+  return (c ^ 0xffffffff) >>> 0;
+}
+
 async function openDir() {
   const root = await rootDirectory();
   return root.getDirectoryHandle(DIR, { create: true });
@@ -72,14 +92,16 @@ export async function openBlobStore() {
           ? "gzip"
           : null;
 
-      // Count the bytes going in. Once compressed, the file size is the stored
-      // size, not the payload's real length — and the real length is what a
-      // caller means by "how big is this".
+      // Measure and checksum on the way past. Once compressed, the file size is
+      // the stored size rather than the payload's real length, and the real
+      // length is what a caller means by "how big is this".
       let received = 0;
+      let crc = 0;
       const measured = stream.pipeThrough(
         new TransformStream({
           transform(chunk, controller) {
             received += chunk.byteLength ?? chunk.length ?? 0;
+            crc = crc32(crc, chunk);
             controller.enqueue(chunk);
           },
         }),
@@ -94,7 +116,15 @@ export async function openBlobStore() {
       // contents intact, which is exactly what a resume needs.
       await body.pipeTo(writable);
 
-      return { size: offset + received, stored: (await file.getFile()).size, encoding };
+      // With an offset the checksum covers only the appended part, so it is
+      // reported as partial rather than pretending to describe the whole file.
+      return {
+        size: offset + received,
+        stored: (await file.getFile()).size,
+        encoding,
+        crc,
+        partial: resuming,
+      };
     },
 
     /**

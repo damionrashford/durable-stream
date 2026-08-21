@@ -78,5 +78,13 @@ export function createQueryClient({ backfill }) {
       await sync();
       return call("status");
     },
+
+    /** Discard the model and replay the log. Used when the log has been trimmed. */
+    async resync() {
+      if (!worker) return;
+      await call("reset");
+      synced = null;
+      await sync();
+    },
   };
 }

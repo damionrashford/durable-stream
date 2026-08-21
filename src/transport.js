@@ -217,6 +217,15 @@ function frameSink() {
         return;
       }
 
+      // A payload is terminated by whatever comes next. Without this a sender
+      // that under-delivers leaves the body stream open forever, the write
+      // waiting on it never resolves, and the frame loop stops consuming — the
+      // connection looks alive while nothing moves.
+      if (payload) {
+        payload.controller.close();
+        payload = null;
+      }
+
       let parsed;
       try {
         parsed = JSON.parse(message);
