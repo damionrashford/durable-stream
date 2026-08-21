@@ -106,7 +106,8 @@ dependable, and a wedged profile survives `launch.ts nuke`.
 |---|---|
 | What a route returns | `src/handler.js` |
 | Method matching, HEAD, 405 | `src/router.js` |
-| Retention size and quota response | `src/log.js` |
+| Log retention count and quota response | `src/log.js` |
+| Payload byte budget, pressure limit | `workers/service-worker.js`, `src/handler.js` |
 | Compression threshold, range slicing | `src/blobs.js` |
 | Resumable threshold, Background Fetch threshold | `src/upstream.js` |
 | Transport choice, handshake timeout, WS queue bound | `src/transport.js` |

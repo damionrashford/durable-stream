@@ -81,9 +81,11 @@ as real once its `blob` event commits.
 | Read model | SQLite wasm | derived, disposable, rebuilt from the log |
 | App shell | Cache Storage | so there is something to read the log *with* offline |
 
-Retention trims the log to 5000 events and sweeps the payloads those events were the
-only reference to, so both halves stay bounded. `QuotaExceededError` triggers a harder
-trim and one retry.
+Retention trims the log to 5000 events, sweeps payloads no surviving event references,
+and evicts oldest-first to hold payloads under a byte budget — a count says nothing
+about size, so both are enforced. A write above 80% of quota reclaims space before
+trying, which turns a failure between scheduled passes into a slower write that
+succeeds. `QuotaExceededError` still triggers a harder trim and one retry.
 
 ## Layout
 
@@ -174,8 +176,14 @@ page's navigation passes through the worker, so the response can be re-wrapped.
 Measured with it on: `crossOriginIsolated === true` and `SharedArrayBuffer` available
 on GitHub Pages. The first load is never isolated; it begins on the next one.
 
-It's off because the SQL worker fails to start under isolation, and nothing here needs
-`SharedArrayBuffer` yet. Turn it on when something does, and fix that first.
+Both things isolation used to exclude are handled. A module worker loaded from a URL
+fails to start under it, reporting an error with every field empty, so the SQL worker is
+built from a blob of its own source instead. And a cross-origin iframe is refused unless
+it carries COEP of its own, so a relay needs the `credentialless` attribute, which lifts
+that requirement in exchange for an ephemeral, cookie-less context.
+
+It stays off because nothing here needs `SharedArrayBuffer`, not because anything is
+blocked by it.
 
 ## Verified, not asserted
 
@@ -194,8 +202,10 @@ Run against headless Chrome:
 ## Known limits
 
 - No auth. The origin is the only boundary; any script on it can read the log.
-- Retention is a count, not a size. A workload of large payloads can reach quota
-  between passes, which surfaces as `507` rather than data loss.
-- Cross-origin isolation and the SQL read model cannot both be on.
+- Retention is enforced two ways — a count on the log and a byte budget on
+  payloads — but a single payload larger than the remaining quota still cannot
+  be stored, and answers `507`.
+- Cross-origin isolation is off by default because nothing here needs
+  `SharedArrayBuffer`, not because anything is excluded by it.
 
 Working on this? See [AGENTS.md](AGENTS.md).

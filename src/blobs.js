@@ -159,13 +159,39 @@ export async function openBlobStore() {
 
     /** Drop payloads the log no longer references. Called after the log trims. */
     async sweep(live) {
+      const keep = new Set(live);
       let removed = 0;
       for (const { key } of await api.list()) {
-        if (live.has(key)) continue;
+        if (keep.has(key)) continue;
         await api.delete(key);
         removed += 1;
       }
       return removed;
+    },
+
+    /**
+     * Enforce a byte budget, oldest first.
+     *
+     * A count-based retention says nothing about size, so a run of large
+     * payloads reaches quota while the log is still well inside its limit. This
+     * is the other half: hold total bytes under a budget, and drop from the
+     * front of the log's own order rather than by size, so eviction stays
+     * predictable instead of preferring whatever happens to be biggest.
+     */
+    async evictTo(budget, oldestFirst) {
+      const files = new Map((await api.list()).map((f) => [f.key, f.stored]));
+      let total = [...files.values()].reduce((n, v) => n + v, 0);
+      const evicted = [];
+
+      for (const key of oldestFirst) {
+        if (total <= budget) break;
+        const size = files.get(key);
+        if (size === undefined) continue;
+        await api.delete(key);
+        total -= size;
+        evicted.push(key);
+      }
+      return { evicted, total };
     },
 
     /**

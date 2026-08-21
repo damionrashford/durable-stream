@@ -142,11 +142,22 @@ export async function openLog() {
       return cursor ? cursor.value.id : 0;
     },
 
-    /** Payload keys the log still references. Anything else in OPFS is orphaned. */
+    /**
+     * Payload keys the log still references, oldest first.
+     *
+     * Order matters as much as membership: anything absent is orphaned and can
+     * go, and when space is short the front of this list is what goes next.
+     */
     async liveKeys() {
-      const keys = new Set();
+      const keys = [];
+      const seen = new Set();
       for await (const e of api.since(0)) {
-        if (e.type === "blob" || e.type === "blob-pending") keys.add(e.data?.key);
+        const key = e.data?.key;
+        if (!key || seen.has(key)) continue;
+        if (e.type === "blob" || e.type === "blob-pending") {
+          seen.add(key);
+          keys.push(key);
+        }
       }
       return keys;
     },

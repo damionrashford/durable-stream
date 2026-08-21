@@ -42,7 +42,7 @@ const OUTBOX_TAG = "outbox";
  * fails before any of this runs. Bump VERSION to invalidate; entries are
  * served cache-first, so an edit is otherwise invisible to a controlled page.
  */
-const VERSION = "shell-v5";
+const VERSION = "shell-v10";
 const SHELL = [
   "./",
   "./index.html",
@@ -57,11 +57,14 @@ const SHELL = [
   "./src/blobs.js",
   "./src/transport.js",
   "./src/upstream.js",
-  "./workers/query.js",
 ];
 
-/** Minimum gap between retention passes. */
+/** Minimum gap between scheduled retention passes. */
 const MAINTENANCE_MS = 30_000;
+
+/** Total bytes payloads may occupy before the oldest are evicted. */
+const PAYLOAD_BUDGET = 256 * 1024 * 1024;
+
 
 self.addEventListener("install", (event) =>
   event.waitUntil(
@@ -115,16 +118,28 @@ function boot() {
      */
     let lastMaintenance = 0;
     let maintaining = null;
-    const maintain = () => {
-      if (maintaining || Date.now() - lastMaintenance < MAINTENANCE_MS) return;
-      maintaining = (async () => {
-        try {
-          if (await log.trim()) await blobs.sweep(await log.liveKeys());
-        } finally {
-          lastMaintenance = Date.now();
-          maintaining = null;
-        }
-      })();
+
+    const pass = async () => {
+      await log.trim();
+      const live = await log.liveKeys();
+      await blobs.sweep(live);
+      // Count-based retention says nothing about size, so the byte budget runs
+      // every pass rather than only when the log happened to be trimmed.
+      await blobs.evictTo(PAYLOAD_BUDGET, live);
+    };
+
+    /**
+     * `force` runs a pass immediately and waits for it. A write that would
+     * otherwise fail on quota can then make room first, which turns a 507
+     * between scheduled passes into a slower write that succeeds.
+     */
+    const maintain = (force = false) => {
+      if (!force && (maintaining || Date.now() - lastMaintenance < MAINTENANCE_MS)) return;
+      maintaining ??= pass().finally(() => {
+        lastMaintenance = Date.now();
+        maintaining = null;
+      });
+      return force ? maintaining : undefined;
     };
 
     return {
@@ -197,8 +212,29 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (event.request.method !== "GET") return;
+
+  // Worker scripts are loaded by the runtime, not fetched by the page, and a
+  // response handed back by this worker is refused under require-corp in a way
+  // that surfaces as a worker which never starts and reports nothing. Letting
+  // them go straight to the network costs the SQL read model its offline start,
+  // which it can afford: it is derived and rebuilt from the log.
+  if (event.request.destination === "worker" || event.request.destination === "sharedworker") return;
+
   event.respondWith(serveShell(event));
 });
+
+/*
+ * Under require-corp a response a service worker hands back is subject to the
+ * embedder policy, and one that carries no opinion is refused — which shows up
+ * as a worker script that fails to start with an error carrying no detail.
+ * Stating same-origin explicitly is what makes a served response admissible.
+ */
+function isolated(response) {
+  if (!ISOLATE || !response || response.type === "opaque") return response;
+  const headers = new Headers(response.headers);
+  headers.set("cross-origin-resource-policy", "same-origin");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
 
 /*
  * Cache-first, but only for what SHELL named.
@@ -214,11 +250,11 @@ self.addEventListener("fetch", (event) => {
  */
 async function serveShell(event) {
   const cached = await caches.match(event.request, { ignoreSearch: true });
-  if (cached) return cached;
+  if (cached) return isolated(cached);
 
   try {
     // Already in flight alongside worker boot, if navigation preload applied.
-    return (await event.preloadResponse) || (await fetch(event.request));
+    return isolated((await event.preloadResponse) || (await fetch(event.request)));
   } catch (err) {
     if (event.request.mode === "navigate") {
       const shell = await caches.match("./index.html", { ignoreSearch: true });

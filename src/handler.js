@@ -47,6 +47,9 @@ function cursorOf(request) {
 /** Events the reader may fall behind by before we stop queueing for it. */
 const HIGH_WATER = 64;
 
+/** Fraction of the origin quota above which a write reclaims space first. */
+const PRESSURE_LIMIT = 0.8;
+
 function streamEvents(request, { log }) {
   const resumeFrom = cursorOf(request);
   let unsubscribe = null;
@@ -158,9 +161,15 @@ async function appendEvent(request, ctx) {
  * OPFS and IndexedDB, so the log is the authority: an orphaned file is recoverable
  * garbage, but a logged event with no bytes is a broken promise.
  */
-async function putBlob(request, { log, blobs, maintain }, { key }) {
+async function putBlob(request, { log, blobs, maintain, storageStatus }, { key }) {
   const mime = request.headers.get("x-mime") || "application/octet-stream";
   const name = request.headers.get("x-name") ?? key;
+
+  // Make room before writing rather than after failing. Retention runs on a
+  // timer, so without this a run of large payloads reaches quota between passes
+  // and the write fails for space that was about to be reclaimed anyway.
+  const { pressure } = await storageStatus();
+  if (pressure > PRESSURE_LIMIT) await maintain?.(true);
 
   let size;
   let stored;
@@ -168,10 +177,11 @@ async function putBlob(request, { log, blobs, maintain }, { key }) {
   try {
     ({ size, stored, encoding } = await blobs.put(key, request.body, mime));
   } catch (err) {
-    // Out of space. blobs.put() already removed the partial file, so the store
-    // is consistent; the caller decides whether to trim and retry.
-    if (isQuota(err)) return json({ error: "quota exceeded", key }, 507);
-    throw err;
+    if (!isQuota(err)) throw err;
+    // blobs.put() removed the partial file, so the store is consistent. One
+    // forced pass, then the caller is told for real.
+    await maintain?.(true);
+    return json({ error: "quota exceeded", key }, 507);
   }
 
   const meta = { name, mime, size, stored, encoding };

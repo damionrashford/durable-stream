@@ -8,15 +8,30 @@
 
 const WORKER_URL = new URL("../workers/query.js", import.meta.url);
 
+/**
+ * Load the worker from a blob built out of its own source.
+ *
+ * Under cross-origin isolation a module worker loaded from a URL fails to start
+ * and reports an error with every field empty — the same source run from a blob
+ * URL starts and works. Fetching once and constructing from the bytes sidesteps
+ * whatever the URL path trips over, and costs one request that was going to
+ * happen anyway. The import inside it is absolute, so it still resolves.
+ */
+async function workerURL() {
+  if (!globalThis.crossOriginIsolated) return WORKER_URL;
+  const source = await (await fetch(WORKER_URL)).text();
+  return URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+}
+
 export function createQueryClient({ backfill }) {
   let worker = null;
   let seq = 0;
   let synced = null;
   const waiting = new Map();
 
-  function spawn() {
+  async function spawn() {
     if (worker) return worker;
-    worker = new Worker(WORKER_URL, { type: "module" });
+    worker = new Worker(await workerURL(), { type: "module" });
     worker.addEventListener("message", (event) => {
       const { id, ok, result, error } = event.data ?? {};
       const pending = waiting.get(id);
@@ -27,8 +42,8 @@ export function createQueryClient({ backfill }) {
     return worker;
   }
 
-  function call(type, args = {}) {
-    const w = spawn();
+  async function call(type, args = {}) {
+    const w = await spawn();
     const id = ++seq;
     return new Promise((resolve, reject) => {
       waiting.set(id, { resolve, reject });
